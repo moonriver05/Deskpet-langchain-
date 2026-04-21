@@ -6,10 +6,11 @@ import datetime
 import random
 import base64
 import re
+import pymysql
 import PyQt5
 from openai import OpenAI
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 
 # 关键：手动指定 Qt 插件目录
 plugin_path = os.path.join(os.path.dirname(PyQt5.__file__), "Qt5", "plugins")
@@ -25,10 +26,68 @@ from PyQt5.QtCore import Qt, QPoint, QTimer, QSize, QThread, pyqtSignal
 from PyQt5.QtGui import QPixmap, QPainter, QFont, QColor, QPolygon, QMovie, QIcon
 
 
+# ==================== 数据库与长期记忆管理 ====================
+DB_CONFIG = {
+    'host': 'localhost',
+    'user': 'root',
+    'password': '数据库密码',  # TODO: 请修改为你的 MySQL 密码
+    'charset': 'utf8mb4'
+}
+DB_NAME = 'pet_memory_db'
+
+def init_db():
+    try:
+        # 连接时不指定 database，以防数据库还未创建
+        conn = pymysql.connect(host=DB_CONFIG['host'], user=DB_CONFIG['user'], password=DB_CONFIG['password'], charset=DB_CONFIG['charset'])
+        with conn.cursor() as cursor:
+            cursor.execute(f"CREATE DATABASE IF NOT EXISTS {DB_NAME} DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
+        conn.commit()
+        conn.select_db(DB_NAME)
+        
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS user_memory (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    content VARCHAR(500) NOT NULL,
+                    keywords VARCHAR(200),
+                    importance_score FLOAT DEFAULT 10.0,
+                    access_count INT DEFAULT 1,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    last_accessed_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print("数据库初始化失败 (请检查 MySQL 是否启动及密码是否正确):", e)
+
+def daily_decay_memory():
+    """艾宾浩斯遗忘衰减：每天执行一次，按时间扣除权重，权重<=0则遗忘"""
+    try:
+        conn = pymysql.connect(host=DB_CONFIG['host'], user=DB_CONFIG['user'], password=DB_CONFIG['password'], database=DB_NAME, charset=DB_CONFIG['charset'])
+        with conn.cursor() as cursor:
+            # 距今超过1天未访问的记忆，每天扣除 1 点权重
+            cursor.execute("UPDATE user_memory SET importance_score = importance_score - 1 WHERE DATEDIFF(NOW(), last_accessed_at) >= 1")
+            # 彻底遗忘（删除）权重<=0 的记忆
+            cursor.execute("DELETE FROM user_memory WHERE importance_score <= 0")
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print("记忆衰减执行失败:", e)
+
 # ==================== 桌宠主体 ====================
 class DesktopPet(QWidget):
     def __init__(self):
         super().__init__()
+        # 初始化数据库及记忆衰减
+        init_db()
+        daily_decay_memory()
+        
+        # 每天定时再执行一次遗忘整理 (86400000 毫秒 = 24小时)
+        self.decay_timer = QTimer()
+        self.decay_timer.timeout.connect(daily_decay_memory)
+        self.decay_timer.start(1000 * 60 * 60 * 24)
+        
         self.todo_window = None
         self.chat_window = None
         self.offset = QPoint()
@@ -440,17 +499,97 @@ class LLMFetcherThread(QThread):
 
     def run(self):
         try:
-            api_key = "你的api"
-            base_url = "你的模型地址"
+            api_key = "模型api"
+            base_url = "模型地址"
 
             # 使用 langchain_openai 的 ChatOpenAI 接口
             llm = ChatOpenAI(
-                model="你的模型",
+                model="模型名称",
                 openai_api_key=api_key,
                 openai_api_base=base_url,
                 max_tokens=2048,
                 temperature=0.7,
+                model_kwargs={
+                    "extra_body": {
+                        "thinking": {"type": "disabled"}#此处模型深度思考默认关闭，聊天速度快一点消耗token少一点（根据需要调整）
+                    }
+                }
             )
+
+            # ===== 1. 双开模型 (模型1)：记忆提取与搜索关键词提取 =====
+            extractor_prompt = f"""请分析以下用户输入。
+1. 提取出能概括这句话的 1 到 3 个核心关键词（用逗号分隔，方便用作数据库检索）。
+2. 判断这句话是否包含用户的个人喜好、习惯或某些重要事实。如果有，请提取为一句简短的描述；如果没有，请仅填“无”。
+3. 同时用户询问对象如果是和桌宠有关的东西，指向的主体都是久远寺有珠，所以数据库保存的询问主体应该是“久远寺有珠”。
+请严格按以下格式输出，不要有任何多余的废话：
+关键词：xxx,yyy
+新记忆：事实描述或“无”
+
+用户输入：{self.user_text}"""
+            
+            ext_msg = HumanMessage(content=extractor_prompt)
+            ext_response = llm.invoke([ext_msg]).content.strip()
+            
+            search_keywords = []
+            new_fact = "无"
+            for line in ext_response.split('\n'):
+                if line.startswith("关键词："):
+                    kws = line.replace("关键词：", "").split(",")
+                    search_keywords = [k.strip() for k in kws if k.strip() and k.strip() != "无"]
+                elif line.startswith("新记忆："):
+                    new_fact = line.replace("新记忆：", "").strip()
+
+            # ===== 2. 数据库操作：存储新记忆 & 模糊匹配复习记忆 =====
+            memory_context_str = "无"
+            try:
+                conn = pymysql.connect(
+                    host=DB_CONFIG['host'], user=DB_CONFIG['user'],
+                    password=DB_CONFIG['password'], database=DB_NAME,
+                    charset=DB_CONFIG['charset'], cursorclass=pymysql.cursors.DictCursor
+                )
+                with conn.cursor() as cursor:
+                    # 如果有新记忆，写入数据库
+                    if new_fact and new_fact != "无":
+                        cursor.execute(
+                            "INSERT INTO user_memory (content, keywords) VALUES (%s, %s)",
+                            (new_fact, ",".join(search_keywords))
+                        )
+                    
+                    # 使用提取的关键词进行数据库模糊匹配
+                    matched_memories = []
+                    if search_keywords:
+                        conditions = " OR ".join(["content LIKE %s" for _ in search_keywords])
+                        params = [f"%{k}%" for k in search_keywords]
+                        sql = f"SELECT id, content FROM user_memory WHERE {conditions} ORDER BY importance_score DESC LIMIT 5"
+                        cursor.execute(sql, params)
+                        results = cursor.fetchall()
+                        
+                        for row in results:
+                            matched_memories.append(row['content'])
+                            # 复习强化记忆：增加权重，增加访问次数，更新访问时间
+                            update_sql = """
+                                UPDATE user_memory 
+                                SET access_count = access_count + 1, 
+                                    importance_score = importance_score + 5, 
+                                    last_accessed_at = NOW() 
+                                WHERE id = %s
+                            """
+                            cursor.execute(update_sql, (row['id'],))
+                    
+                    if matched_memories:
+                        memory_context_str = "\n".join(f"- {m}" for m in matched_memories)
+                        
+                conn.commit()
+                conn.close()
+            except Exception as db_e:
+                print("数据库操作异常 (可能未配置MySQL密码或服务未启动):", db_e)
+
+            # ===== 3. 组装最终 Prompt (模型2)：带上核心设定与长期记忆 =====
+            system_prompt = f"""你是久远寺有珠（Kuonji Alice），型月世界观《魔法使之夜》中的魔女。
+【核心设定】：你性格孤高、冷淡、守旧、沉默寡言。你说话简短，通常带有距离感，但在熟悉之后会展露出一丝傲娇和隐晦的关心。你遵守魔女的传统，不苟言笑。请不要打破角色设定。
+【长期记忆】：以下是你脑海中关于该用户的长期记忆（如果有）：
+{memory_context_str}
+请结合上述记忆和核心设定，以久远寺有珠的口吻回复用户。"""
 
             # 构造符合 langchain 格式的消息
             content = []
@@ -477,13 +616,14 @@ class LLMFetcherThread(QThread):
                 # 如果用户说了“图片”相关的词且没有拖拽图片，则自动发送演示图片
                 content.insert(0, {
                     "type": "image_url",
-                    "image_url": {"url": "img的地址"}
+                    "image_url": {"url": "演示图片"}
                 })
 
             message = HumanMessage(content=content)
+            sys_message = SystemMessage(content=system_prompt)
             
             # 调用大模型
-            response = llm.invoke([message])
+            response = llm.invoke([sys_message, message])
             reply_text = response.content
 
             # 修复可能存在的转义换行符，将其转换为自然换行
@@ -684,7 +824,7 @@ class ChatWindow(QWidget):
         self.add_message(reply_text, is_user=False)
         
         if self.pet:
-            self.pet.show_bubble("我回复你啦~", duration=3000)
+            self.pet.show_bubble("回复你了,记得看信息", duration=3000)
 
     def on_llm_error(self, error_msg):
         self.send_btn.setEnabled(True)
@@ -825,16 +965,16 @@ class ChatWindow(QWidget):
 class HomeworkFetcherThread(QThread):
     finished_signal = pyqtSignal(list)
     error_signal = pyqtSignal(str)
-    #这里是登录之后找到你的登录token获取课程表，再根据课程表遍历获取作业。
+
     def run(self):
         try:
-            homework_url = "这是作业地址"
-            clas = "课程地址"
+            homework_url = "作业地址"
+            clas = "课程列表地址"
             session = requests.Session()
-            lg_url = "登陆位置"
+            lg_url = "登陆地址"
             lg_data = {
-                "loginName": "登陆账号",
-                "password": "登陆密码"
+                "loginName": "登陆密码",
+                "password": "登陆账号"
             }
             login_response = session.post(lg_url, data=lg_data)
             
