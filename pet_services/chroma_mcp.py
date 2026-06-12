@@ -105,6 +105,7 @@ def _chrom_tool_to_dict(result):
 _chrom_worker_thread = None
 _chrom_worker_loop = None
 _chrom_request_q = None
+_chrom_worker_lock = threading.Lock()
 _chrom_ready = threading.Event()
 _CHROM_SHUTDOWN = object()
 
@@ -113,18 +114,19 @@ def _chrom_worker_main():
     global _chrom_worker_loop, _chrom_request_q
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    _chrom_worker_loop = loop
+    request_q = asyncio.Queue()
+    with _chrom_worker_lock:
+        _chrom_worker_loop = loop
+        _chrom_request_q = request_q
 
     async def runner():
-        global _chrom_request_q
-        _chrom_request_q = asyncio.Queue()
         params = _chroma_docker_stdio_params()
         async with stdio_client(params) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 _chrom_ready.set()
                 while True:
-                    tool_name, arguments, py_fut = await _chrom_request_q.get()
+                    tool_name, arguments, py_fut = await request_q.get()
                     if tool_name is _CHROM_SHUTDOWN:
                         py_fut.set_result(None)
                         break
@@ -136,7 +138,16 @@ def _chrom_worker_main():
 
     try:
         loop.run_until_complete(runner())
+    except BaseException as e:
+        print("[Chroma MCP] worker stopped:", e)
     finally:
+        _chrom_ready.clear()
+        with _chrom_worker_lock:
+            if _chrom_worker_loop is loop:
+                _chrom_worker_loop = None
+                _chrom_request_q = None
+            if _chrom_worker_thread is threading.current_thread():
+                globals()["_chrom_worker_thread"] = None
         try:
             loop.run_until_complete(loop.shutdown_asyncgens())
         except Exception:
@@ -146,43 +157,53 @@ def _chrom_worker_main():
 
 def _chrom_ensure_worker():
     global _chrom_worker_thread
-    need_start = _chrom_worker_thread is None or not _chrom_worker_thread.is_alive()
-    if need_start:
-        _chrom_ready.clear()
-        _chrom_worker_thread = threading.Thread(
-            target=_chrom_worker_main, name="ChromaMcpWorker", daemon=True
-        )
-        _chrom_worker_thread.start()
-        if not _chrom_ready.wait(timeout=180):
-            raise RuntimeError(
-                "Chroma MCP 工作线程启动超时（请确认 Docker 已运行且镜像 mcp/chroma 可用）"
+    with _chrom_worker_lock:
+        need_start = _chrom_worker_thread is None or not _chrom_worker_thread.is_alive()
+        if need_start:
+            _chrom_ready.clear()
+            _chrom_worker_thread = threading.Thread(
+                target=_chrom_worker_main, name="ChromaMcpWorker", daemon=True
             )
+            _chrom_worker_thread.start()
+    if not _chrom_ready.wait(timeout=180):
+        raise RuntimeError(
+            "Chroma MCP worker startup timed out; check Docker and the mcp/chroma image."
+        )
 
 
 def _chrom_run_tool(tool_name, arguments):
     _chrom_ensure_worker()
     py_fut = concurrent.futures.Future()
+    with _chrom_worker_lock:
+        loop = _chrom_worker_loop
+        request_q = _chrom_request_q
+    if loop is None or request_q is None:
+        raise RuntimeError("Chroma MCP worker is not ready")
 
     async def enqueue():
-        await _chrom_request_q.put((tool_name, arguments, py_fut))
+        await request_q.put((tool_name, arguments, py_fut))
 
-    asyncio.run_coroutine_threadsafe(enqueue(), _chrom_worker_loop).result(timeout=60)
+    asyncio.run_coroutine_threadsafe(enqueue(), loop).result(timeout=60)
     return py_fut.result(timeout=600)
 
 
 def _chrom_shutdown_worker():
     global _chrom_worker_thread, _chrom_worker_loop, _chrom_request_q
     try:
-        if _chrom_worker_thread is None or not _chrom_worker_thread.is_alive():
+        with _chrom_worker_lock:
+            thread = _chrom_worker_thread
+            loop = _chrom_worker_loop
+            request_q = _chrom_request_q
+        if thread is None or not thread.is_alive():
             return
-        if _chrom_worker_loop is None or _chrom_request_q is None:
+        if loop is None or request_q is None:
             return
         py_fut = concurrent.futures.Future()
 
         async def shutdown():
-            await _chrom_request_q.put((_CHROM_SHUTDOWN, None, py_fut))
+            await request_q.put((_CHROM_SHUTDOWN, None, py_fut))
 
-        asyncio.run_coroutine_threadsafe(shutdown(), _chrom_worker_loop).result(timeout=30)
+        asyncio.run_coroutine_threadsafe(shutdown(), loop).result(timeout=30)
         py_fut.result(timeout=15)
     except Exception:
         pass
@@ -241,4 +262,3 @@ def chroma_delete_documents_sync(collection_name, ids):
     if not ids:
         return
     _chrom_run_tool("chroma_delete_documents", {"collection_name": collection_name, "ids": list(ids)})
-
