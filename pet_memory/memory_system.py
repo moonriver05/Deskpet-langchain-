@@ -1,6 +1,7 @@
 """Memory, profile, and recall subsystem for the desktop pet app."""
 
 import concurrent.futures
+import datetime
 import json
 import math
 import re
@@ -8,6 +9,7 @@ import threading
 import time
 
 import pymysql
+from openai import OpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
