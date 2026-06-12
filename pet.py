@@ -9,18 +9,76 @@ import base64
 import re
 import pymysql
 import math
-import asyncio
-import atexit
 import concurrent.futures
 import threading
 import uuid
 import PyQt5
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
 from openai import OpenAI
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 from zhdate import ZhDate
+from pet_core.config import CONFIG_SCHEMA, REQUIRED_KEYS, app_config
+from pet_core.persona import (
+    ALICE_PROACTIVE_PERSONA,
+    ALICE_RESPONSE_STYLE,
+    ALICE_RUNTIME_CAPABILITIES,
+    DEFAULT_CATEGORY_DESCRIPTIONS,
+    build_current_response_card,
+    format_capability_registry_for_prompt,
+)
+from pet_core.proactive import (
+    clean_proactive_message,
+    format_proactive_context_for_prompt,
+)
+from pet_core.timer_parser import (
+    format_focus_duration,
+    parse_focus_timer_intent,
+)
+from pet_features.todo_system import (
+    TodoToolRouterThread,
+    TodoWindow,
+    has_explicit_todo_write_intent,
+    todo_store,
+)
+from pet_memory.memory_system import (
+    DB_CONFIG,
+    DB_NAME,
+    MEM_IMP_CAP,
+    MEM_PROMOTE_TO_LONG_TERM_SCORE,
+    MEM_REPEATED_BUMP,
+    _clean_profile_claim_text,
+    _initial_importance_for_memory,
+    _is_bad_profile_claim,
+    _normalize_profile_category,
+    _profile_bucket_for_memory,
+    _profile_refiner_enabled,
+    _refresh_user_profile_from_claims,
+    configure_memory_database,
+    conversation_history,
+    daily_decay_memory,
+    delete_profile_evidence_for_source,
+    delete_short_memory_from_chroma,
+    get_db_name,
+    get_user_profile_prompt_context,
+    init_db,
+    knowledge_base,
+    memory_runtime,
+    promote_memory_to_long_term,
+    refresh_user_profile_from_long_term,
+    schedule_chroma_sync_repair,
+    schedule_profile_refine,
+    schedule_refine_unprocessed_long_term_memories,
+    soul_state,
+    sync_short_memory_to_chroma,
+)
+from pet_services.chroma_mcp import (
+    CHROMA_COLLECTION_MEM,
+    chrom_distance_to_sim,
+    chroma_add_documents_sync,
+    chroma_delete_documents_sync,
+    chroma_query_documents_sync,
+    configure_chroma,
+)
 try:
     import fitz  # PyMuPDF
 except ImportError:
@@ -43,204 +101,7 @@ except ImportError:
     pass
 
 
-# ==================== 配置中心 (AppConfig) ====================
-# 把所有 API key / 密码 / URL 模板这种"上传 GitHub 时必须留空"的东西，
-# 全部集中到一个本地 JSON 文件里：pet_config.json（与 pet.py 同目录）。
-#   - 用户首次启动：检测到 mysql/ark 等必填项为空 → 弹设置窗口让其填写；
-#   - 之后右键桌宠 → ⚙ 设置 → 一键改所有 key；
-#   - 这份 JSON 不要 commit 到 Github（README 建议加 .gitignore）。
-#
-# 整个模块对外只有：
-#   app_config.get("ark.api_key")              # dot-path 取
-#   app_config.set("ark.api_key", "new")       # dot-path 写（不会自动落盘）
-#   app_config.save()                          # 写回磁盘
-#   app_config.missing_required()              # 返回缺失的必填项 list
-#   apply_config_to_globals()                  # 把 AppConfig 的值同步到老的全局变量
-CONFIG_FILE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "pet_config.json",
-)
-
-# CONFIG_SCHEMA 既是默认值来源，也是 SettingsWindow 用来动态生成表单的"元数据"。
-# 每个字段都长这样：
-#   {"key": "...", "label": "...", "default": "...",
-#    "required": bool, "secret": bool, "hint": "...", "type": "int|str|path"}
-CONFIG_SCHEMA = [
-    {
-        "key": "mysql",
-        "title": "MySQL 数据库",
-        "icon": "🗄️",
-        "desc": "用来存长期记忆 / 知识库元数据。需要本地 MySQL 已启动。",
-        "fields": [
-            {"key": "host", "label": "主机",  "default": "localhost", "required": True},
-            {"key": "port", "label": "端口",  "default": 3306, "type": "int"},
-            {"key": "user", "label": "用户名", "default": "root", "required": True},
-            {"key": "password", "label": "密码", "default": "", "required": True, "secret": True},
-            {"key": "database", "label": "数据库名", "default": "pet_memory_db"},
-        ],
-    },
-    {
-        "key": "ark",
-        "title": "火山方舟 LLM",
-        "icon": "🤖",
-        "desc": "主回复 / 记忆抽取 / 工具路由都靠它。去 https://www.volcengine.com/product/ark 申请 API key。",
-        "fields": [
-            {"key": "api_key", "label": "API Key", "default": "", "required": True, "secret": True,
-             "hint": "形如 ark-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx-xxxxxx"},
-            {"key": "base_url", "label": "Base URL", "default": "https://ark.cn-beijing.volces.com/api/v3"},
-            {"key": "model_main", "label": "主回复模型", "default": "doubao-1-5-pro-32k-250115",
-             "hint": "推理质量更好的，例如 doubao-1-5-pro-32k 或 doubao-seed-2.x"},
-            {"key": "model_extractor", "label": "提取器模型", "default": "doubao-seed-2-0-mini-260428",
-             "hint": "抽关键词 / 抽新事实，用 mini 版省钱"},
-            {"key": "model_tool", "label": "工具路由模型", "default": "doubao-seed-2-0-mini-260428",
-             "hint": "判断是否要写待办，用 mini 版即可"},
-        ],
-    },
-    {
-        "key": "cos",
-        "title": "腾讯云 COS（可选）",
-        "icon": "☁️",
-        "desc": "用来托管表情包图床。留空即回复时不带表情包。",
-        "fields": [
-            {"key": "secret_id",  "label": "SecretId",  "default": "", "secret": True},
-            {"key": "secret_key", "label": "SecretKey", "default": "", "secret": True},
-            {"key": "region",     "label": "地域",       "default": "ap-guangzhou"},
-            {"key": "bucket",     "label": "Bucket 名",  "default": "",
-             "hint": "如 emotion-1234567890"},
-            {"key": "base_url",   "label": "图床公网域名", "default": "",
-             "hint": "如 https://emotion-1234567890.cos.ap-guangzhou.myqcloud.com"},
-        ],
-    },
-    {
-        "key": "chroma",
-        "title": "Chroma 向量库（可选）",
-        "icon": "📦",
-        "desc": "通过 docker 复用已运行的 chroma-mcp 容器，默认值一般够用。",
-        "fields": [
-            {"key": "container_name", "label": "容器名", "default": "chroma-mcp"},
-        ],
-    },
-    {
-        "key": "tts",
-        "title": "GPT-SoVITS 语音合成（可选）",
-        "icon": "🔊",
-        "desc": "桌宠回复语音化。需先启动 GPT-SoVITS 自带的 api_v2.py。",
-        "fields": [
-            {"key": "api_base", "label": "服务地址", "default": "http://127.0.0.1:9880"},
-            {"key": "ref_audio", "label": "参考音频路径", "default": "", "type": "path",
-             "hint": "4-10s 的 wav/mp3 绝对路径"},
-            {"key": "ref_text", "label": "参考音频文本", "default": ""},
-            {"key": "ref_lang", "label": "参考音频语种", "default": "ja",
-             "hint": "zh / ja / en"},
-            {"key": "text_lang", "label": "合成输出语种", "default": "zh"},
-            {"key": "gpt_weights",     "label": "GPT 权重相对路径", "default": "",
-             "hint": "相对于 GPT-SoVITS 工程根目录，如 GPT_weights_v2Pro/xxx.ckpt"},
-            {"key": "sovits_weights",  "label": "SoVITS 权重相对路径", "default": "",
-             "hint": "相对于 GPT-SoVITS 工程根目录，如 SoVITS_weights_v2Pro/xxx.pth"},
-        ],
-    },
-    {
-        "key": "ucollege",
-        "title": "优学院作业拉取（可选）",
-        "icon": "📚",
-        "desc": "TodoWindow 里点「获取作业」时用到。账号密码仅本地存。",
-        "fields": [
-            {"key": "login_name", "label": "账号", "default": "", "secret": True},
-            {"key": "password",   "label": "密码", "default": "", "secret": True},
-            {"key": "login_url",        "label": "登录 API",     "default": ""},
-            {"key": "course_list_url",  "label": "课程列表 API", "default": ""},
-            {"key": "homework_url",     "label": "作业 API 模板", "default": "",
-             "hint": "用 {course_id} 占位，如 https://.../{course_id}/homework"},
-        ],
-    },
-]
-
-REQUIRED_KEYS = ["mysql.password", "ark.api_key"]
-
-
-class AppConfig:
-    """单例。所有 secrets / URL 都集中在这里。"""
-
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._data = self._build_defaults()
-        self._load_from_disk()
-
-    @staticmethod
-    def _build_defaults():
-        d = {}
-        for section in CONFIG_SCHEMA:
-            d[section["key"]] = {f["key"]: f.get("default", "") for f in section["fields"]}
-        return d
-
-    def _load_from_disk(self):
-        if not os.path.exists(CONFIG_FILE):
-            return
-        try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if not isinstance(data, dict):
-                return
-            # 浅合并：磁盘有的覆盖默认值；磁盘没的保留默认值（兼容老配置）
-            for section_key, section_val in data.items():
-                if isinstance(section_val, dict) and section_key in self._data:
-                    for k, v in section_val.items():
-                        self._data[section_key][k] = v
-        except Exception as e:
-            print(f"[AppConfig] 加载 {CONFIG_FILE} 失败：{e}")
-
-    def get(self, dot_path, default=None):
-        cur = self._data
-        for part in dot_path.split("."):
-            if not isinstance(cur, dict) or part not in cur:
-                return default
-            cur = cur[part]
-        if cur is None or cur == "":
-            return default if default is not None else cur
-        return cur
-
-    def set(self, dot_path, value):
-        parts = dot_path.split(".")
-        with self._lock:
-            cur = self._data
-            for p in parts[:-1]:
-                if p not in cur or not isinstance(cur[p], dict):
-                    cur[p] = {}
-                cur = cur[p]
-            cur[parts[-1]] = value
-
-    def get_section(self, section_key):
-        return dict(self._data.get(section_key) or {})
-
-    def update_section(self, section_key, values):
-        with self._lock:
-            if section_key not in self._data:
-                self._data[section_key] = {}
-            self._data[section_key].update(values)
-
-    def save(self):
-        with self._lock:
-            try:
-                # 写到磁盘前再做一次"用户头一回填完"的兜底初始化
-                with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-                    json.dump(self._data, f, ensure_ascii=False, indent=2)
-                print(f"[AppConfig] 已保存到 {CONFIG_FILE}")
-                return True
-            except Exception as e:
-                print(f"[AppConfig] 保存失败：{e}")
-                return False
-
-    def missing_required(self):
-        miss = []
-        for key in REQUIRED_KEYS:
-            if not self.get(key):
-                miss.append(key)
-        return miss
-
-
-app_config = AppConfig()
-
-
+# ==================== ???? (AppConfig) ====================
 def apply_config_to_globals():
     """把 app_config 的值同步到老的模块级全局变量（DB_CONFIG / COS_CONFIG / ark_api_key 等）。
     设置窗口保存后会再调一次，使新值即时生效（不用重启）。
@@ -248,16 +109,8 @@ def apply_config_to_globals():
     global ark_api_key
 
     mysql_cfg = app_config.get_section("mysql")
-    DB_CONFIG["host"] = mysql_cfg.get("host") or "localhost"
-    DB_CONFIG["user"] = mysql_cfg.get("user") or "root"
-    DB_CONFIG["password"] = mysql_cfg.get("password") or ""
-    DB_CONFIG["charset"] = "utf8mb4"
-    try:
-        DB_CONFIG["port"] = int(mysql_cfg.get("port") or 3306)
-    except (TypeError, ValueError):
-        DB_CONFIG["port"] = 3306
-    # DB_NAME 是 module-level，单独同步
-    globals()["DB_NAME"] = mysql_cfg.get("database") or "pet_memory_db"
+    configure_memory_database(mysql_cfg)
+    globals()["DB_NAME"] = get_db_name()
 
     cos_cfg = app_config.get_section("cos")
     COS_CONFIG["secret_id"]  = cos_cfg.get("secret_id")  or ""
@@ -267,854 +120,18 @@ def apply_config_to_globals():
     COS_CONFIG["base_url"]   = cos_cfg.get("base_url")   or ""
 
     chroma_cfg = app_config.get_section("chroma")
-    if chroma_cfg.get("container_name"):
-        CHROMA_MCP_CONFIG["container_name"] = chroma_cfg["container_name"]
+    configure_chroma(chroma_cfg.get("container_name"))
 
     ark_api_key = app_config.get("ark.api_key", "") or ""
 
-    # TTS_* 是模块级常量，本地变量；通过 globals() 写
     tts_cfg = app_config.get_section("tts")
-    if tts_cfg.get("api_base"):
-        globals()["TTS_API_BASE"] = tts_cfg["api_base"]
-    if tts_cfg.get("ref_audio"):
-        globals()["TTS_REF_AUDIO"] = tts_cfg["ref_audio"]
-    if tts_cfg.get("ref_text"):
-        globals()["TTS_REF_TEXT"] = tts_cfg["ref_text"]
-    if tts_cfg.get("ref_lang"):
-        globals()["TTS_REF_LANG"] = tts_cfg["ref_lang"]
-    if tts_cfg.get("text_lang"):
-        globals()["TTS_TEXT_LANG"] = tts_cfg["text_lang"]
-    if tts_cfg.get("gpt_weights"):
-        globals()["TTS_GPT_WEIGHTS"] = tts_cfg["gpt_weights"]
-    if tts_cfg.get("sovits_weights"):
-        globals()["TTS_SOVITS_WEIGHTS"] = tts_cfg["sovits_weights"]
+    configure_tts(tts_cfg, base_dir=os.path.dirname(os.path.abspath(__file__)))
 
 
 # 提前声明 ark_api_key，让 apply_config_to_globals 第一次调用时能 import-time 赋值
 ark_api_key = ""
 
 
-# ==================== 灵魂状态系统 (SoulState) ====================
-class SoulState:
-    def __init__(self):
-        self.recall_depth = 0.5  # 控制 RAG 检索数量
-        self.impression_depth = 0.5  # 控制记忆生成数量
-        self.expression_desire = 0.3  # 控制 LLM 输出长度
-        self.creativity = 0.3  # 控制 LLM 温度参数
-
-    def resonate(self, matched_memories):
-        # 旧记忆状态冲击当前状态
-        impact = len(matched_memories) * 0.1
-        self.recall_depth = math.tanh(self.recall_depth + impact)
-        self.impression_depth = math.tanh(self.impression_depth + impact)
-        self.expression_desire = math.tanh(self.expression_desire + impact)
-        self.creativity = math.tanh(self.creativity + impact)
-
-    def get_params(self):
-        # 映射到具体参数
-        return {
-            "top_k": max(1, int(self.recall_depth * 10)),
-            "memory_limit": max(1, int(self.impression_depth * 5)),
-            "max_tokens": max(500, int(self.expression_desire * 4000)),
-            "temperature": min(1.0, max(0.1, self.creativity))
-        }
-
-soul_state = SoulState()
-
-# ==================== 数据库配置 ====================
-# 真实值来自 AppConfig（pet_config.json）。SettingsWindow 保存后会通过
-# apply_config_to_globals() 原地刷新这个 dict，让新密码立刻生效，无需重启。
-DB_CONFIG = {
-    'host':     app_config.get("mysql.host", "localhost"),
-    'user':     app_config.get("mysql.user", "root"),
-    'password': app_config.get("mysql.password", "") or "",
-    'port':     int(app_config.get("mysql.port", 3306) or 3306),
-    'charset':  'utf8mb4',
-}
-DB_NAME = app_config.get("mysql.database", "pet_memory_db") or "pet_memory_db"
-
-# ==================== Chroma MCP（复用已运行的 chroma-mcp 容器） ====================
-CHROMA_COLLECTION_KB = "pet_knowledge_base"
-CHROMA_COLLECTION_MEM = "pet_user_memory"
-# 关键：默认通过 `docker exec` 进入已经在运行的 chroma-mcp 容器，
-# 而不是 `docker run` 起一个新容器。这样所有读写都落到同一个容器内的同一份持久化数据上。
-CHROMA_MCP_CONFIG = {
-    # 已经在 Docker Desktop 里运行、正在使用的容器名（见 `docker ps`）。
-    # 优先级：环境变量 > AppConfig > 默认 "chroma-mcp"
-    "container_name": (
-        os.environ.get("CHROMA_MCP_CONTAINER")
-        or app_config.get("chroma.container_name")
-        or "chroma-mcp"
-    ),
-    # 容器内启动 MCP server 的命令；mcp/chroma 镜像的默认 CMD 是 `chroma-mcp`。
-    # 关键：必须显式带 `--client-type persistent --data-dir /chroma_data`，
-    # 否则 chroma-mcp 默认是 ephemeral（纯内存），容器一停就全没了。
-    # /chroma_data 必须是容器里被持久化卷挂载到的目录，所以容器要这样起：
-    #   docker run -d --name chroma-mcp --restart unless-stopped \
-    #     -v pet_desktop_chroma:/chroma_data --entrypoint sleep mcp/chroma infinity
-    "container_command": [
-        "chroma-mcp", "--client-type", "persistent", "--data-dir", "/chroma_data",
-    ],
-    # 若容器未运行，是否回退到 `docker run -i --rm mcp/chroma`（仍只起一次，同一个 python 进程内复用）。
-    "fallback_to_run": True,
-    "fallback_image": "mcp/chroma",
-    "fallback_volume_name": "pet_desktop_chroma",
-    "fallback_data_dir_in_container": "/chroma_data",
-}
-
-
-def _container_is_running(name):
-    """查询命名容器是否在 running 状态。Docker 不可用时返回 False。"""
-    if not name:
-        return False
-    import subprocess
-    try:
-        out = subprocess.run(
-            ["docker", "inspect", "-f", "{{.State.Running}}", name],
-            capture_output=True, text=True, timeout=10,
-        )
-    except FileNotFoundError:
-        print("[Chroma MCP] 未找到 docker 可执行文件。")
-        return False
-    except Exception as e:
-        print(f"[Chroma MCP] docker inspect 调用失败: {e}")
-        return False
-    if out.returncode != 0:
-        return False
-    return out.stdout.strip().lower() == "true"
-
-
-def _chroma_docker_stdio_params():
-    """优先 `docker exec -i <container_name> chroma-mcp`，让会话直接跑在已存在的 chroma-mcp 容器里。"""
-    name = CHROMA_MCP_CONFIG.get("container_name") or "chroma-mcp"
-    cmd = list(CHROMA_MCP_CONFIG.get("container_command") or ["chroma-mcp"])
-    if _container_is_running(name):
-        print(f"[Chroma MCP] 复用已运行容器 `{name}`（docker exec -i {name} {' '.join(cmd)}）。")
-        return StdioServerParameters(command="docker", args=["exec", "-i", name] + cmd)
-    if not CHROMA_MCP_CONFIG.get("fallback_to_run"):
-        raise RuntimeError(
-            f"容器 `{name}` 未运行，且已禁用 docker run 回退。请先 `docker start {name}` 再启动桌宠。"
-        )
-    image = CHROMA_MCP_CONFIG.get("fallback_image", "mcp/chroma")
-    vol = CHROMA_MCP_CONFIG.get("fallback_volume_name", "pet_desktop_chroma")
-    data_dir = CHROMA_MCP_CONFIG.get("fallback_data_dir_in_container", "/chroma_data")
-    # 关键：`chroma-mcp` 不读 CHROMA_* 环境变量，必须用命令行参数指定持久化模式，
-    # 否则会以 ephemeral（内存）模式启动，挂载的 volume 形同虚设。
-    args = [
-        "run", "-i", "--rm",
-        "-v", f"{vol}:{data_dir}",
-        "--entrypoint", "chroma-mcp",
-        image,
-        "--client-type", "persistent",
-        "--data-dir", data_dir,
-    ]
-    print(f"[Chroma MCP] 容器 `{name}` 未运行，回退到一次性容器 `docker run --rm {image}`（持久化卷 {vol}）。")
-    return StdioServerParameters(command="docker", args=args)
-
-
-def _chrom_tool_first_text(result):
-    if not result or not getattr(result, "content", None):
-        return None
-    block = result.content[0]
-    return getattr(block, "text", None) if block is not None else None
-
-
-def _chrom_tool_to_dict(result):
-    """兼容 chroma_query_documents 返回 structuredContent 或 JSON 文本。"""
-    if result is None:
-        return None
-    sc = getattr(result, "structuredContent", None)
-    if isinstance(sc, dict) and sc:
-        return sc
-    text = _chrom_tool_first_text(result)
-    if text:
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            pass
-    return None
-
-
-# ---- Chroma MCP 单例：一个后台线程内常驻单个 Docker 容器 + MCP 会话，所有读写共用同一向量库 ----
-_chrom_worker_thread = None
-_chrom_worker_loop = None
-_chrom_request_q = None
-_chrom_ready = threading.Event()
-_CHROM_SHUTDOWN = object()
-
-
-def _chrom_worker_main():
-    global _chrom_worker_loop, _chrom_request_q
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    _chrom_worker_loop = loop
-
-    async def runner():
-        global _chrom_request_q
-        _chrom_request_q = asyncio.Queue()
-        params = _chroma_docker_stdio_params()
-        async with stdio_client(params) as (read, write):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                _chrom_ready.set()
-                while True:
-                    tool_name, arguments, py_fut = await _chrom_request_q.get()
-                    if tool_name is _CHROM_SHUTDOWN:
-                        py_fut.set_result(None)
-                        break
-                    try:
-                        r = await session.call_tool(tool_name, arguments)
-                        py_fut.set_result(r)
-                    except BaseException as e:
-                        py_fut.set_exception(e)
-
-    try:
-        loop.run_until_complete(runner())
-    finally:
-        try:
-            loop.run_until_complete(loop.shutdown_asyncgens())
-        except Exception:
-            pass
-        loop.close()
-
-
-def _chrom_ensure_worker():
-    global _chrom_worker_thread
-    need_start = _chrom_worker_thread is None or not _chrom_worker_thread.is_alive()
-    if need_start:
-        _chrom_ready.clear()
-        _chrom_worker_thread = threading.Thread(
-            target=_chrom_worker_main, name="ChromaMcpWorker", daemon=True
-        )
-        _chrom_worker_thread.start()
-        if not _chrom_ready.wait(timeout=180):
-            raise RuntimeError(
-                "Chroma MCP 工作线程启动超时（请确认 Docker 已运行且镜像 mcp/chroma 可用）"
-            )
-
-
-def _chrom_run_tool(tool_name, arguments):
-    _chrom_ensure_worker()
-    py_fut = concurrent.futures.Future()
-
-    async def enqueue():
-        await _chrom_request_q.put((tool_name, arguments, py_fut))
-
-    asyncio.run_coroutine_threadsafe(enqueue(), _chrom_worker_loop).result(timeout=60)
-    return py_fut.result(timeout=600)
-
-
-def _chrom_shutdown_worker():
-    global _chrom_worker_thread, _chrom_worker_loop, _chrom_request_q
-    try:
-        if _chrom_worker_thread is None or not _chrom_worker_thread.is_alive():
-            return
-        if _chrom_worker_loop is None or _chrom_request_q is None:
-            return
-        py_fut = concurrent.futures.Future()
-
-        async def shutdown():
-            await _chrom_request_q.put((_CHROM_SHUTDOWN, None, py_fut))
-
-        asyncio.run_coroutine_threadsafe(shutdown(), _chrom_worker_loop).result(timeout=30)
-        py_fut.result(timeout=15)
-    except Exception:
-        pass
-
-
-atexit.register(_chrom_shutdown_worker)
-
-
-def _chrom_distance_to_sim(d):
-    try:
-        d = float(d)
-    except (TypeError, ValueError):
-        return 0.0
-    return 1.0 / (1.0 + max(0.0, d))
-
-
-def chroma_query_documents_sync(collection_name, query_texts, n_results, where=None, where_document=None):
-    """同步封装：经单例 MCP 会话执行 chroma_query_documents（同一容器、同一持久化向量库）。"""
-    args = {
-        "collection_name": collection_name,
-        "query_texts": query_texts,
-        "n_results": int(n_results),
-    }
-    if where is not None:
-        args["where"] = where
-    if where_document is not None:
-        args["where_document"] = where_document
-    r = _chrom_run_tool("chroma_query_documents", args)
-    return _chrom_tool_to_dict(r)
-
-
-def chroma_add_documents_sync(collection_name, documents, ids, metadatas=None):
-    args = {"collection_name": collection_name, "documents": documents, "ids": ids}
-    if metadatas is not None:
-        args["metadatas"] = metadatas
-    _chrom_run_tool("chroma_add_documents", args)
-
-
-def chroma_get_documents_sync(collection_name, ids=None, where=None, where_document=None,
-                              include=None, limit=None):
-    """同步封装：chroma_get_documents。用于按 ids 或 metadata 过滤精确取文档（无相似度）。
-    主要场景：知识库 sentence-window 扩展——命中片之后把同 doc_id 的相邻 chunk 一起拉出来。
-    """
-    args = {"collection_name": collection_name}
-    if ids is not None:
-        args["ids"] = list(ids)
-    if where is not None:
-        args["where"] = where
-    if where_document is not None:
-        args["where_document"] = where_document
-    if include is not None:
-        args["include"] = list(include)
-    if limit is not None:
-        args["limit"] = int(limit)
-    r = _chrom_run_tool("chroma_get_documents", args)
-    return _chrom_tool_to_dict(r)
-
-
-def chroma_delete_documents_sync(collection_name, ids):
-    if not ids:
-        return
-    _chrom_run_tool("chroma_delete_documents", {"collection_name": collection_name, "ids": list(ids)})
-
-
-# ==================== 知识库系统 (KnowledgeBase) ====================
-# ---- 文本切分：按 Markdown 标题 / 段落 / chunk_size + overlap，保留章节路径 ----
-def _split_markdown_into_chunks(text, chunk_size=800, overlap=120):
-    """把长文本切成 chunk，保留 Markdown 结构与上下文连续性。
-
-    切分策略（从粗到细）：
-      1. 先按 Markdown 标题 (`#` ~ `######`) 拆 section，并维护 heading_stack
-         作为该 section 的章节路径（如 ["第一章", "第一节"]）。
-      2. 每个 section 内按"空行段落"累加，达到 chunk_size 出片。
-      3. 出片时把上一片末尾的 `overlap` 字符接到下一片开头，让相邻 chunk 有重叠
-         上下文，避免一句话被切到两片导致语义断裂。
-      4. 单段就超过 1.5×chunk_size 时强制按字符切（极端情况兜底）。
-
-    返回 [{"text": str, "heading_path": List[str]}, ...]
-    """
-    if not text or not text.strip():
-        return []
-
-    lines = text.replace("\r\n", "\n").split("\n")
-    heading_stack = []  # [(level, title), ...]，level 越小越靠外
-    sections = []  # [(heading_path_list, block_text)]
-    buf = []
-
-    def flush():
-        if buf:
-            block = "\n".join(buf).strip()
-            if block:
-                sections.append(([h for _, h in heading_stack], block))
-            buf.clear()
-
-    for line in lines:
-        m = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
-        if m:
-            flush()
-            level = len(m.group(1))
-            title = m.group(2).strip()
-            while heading_stack and heading_stack[-1][0] >= level:
-                heading_stack.pop()
-            heading_stack.append((level, title))
-        else:
-            buf.append(line)
-    flush()
-
-    if not sections:
-        sections = [([], text)]
-
-    chunks = []
-    overlap = max(0, int(overlap))
-    chunk_size = max(200, int(chunk_size))
-    hard_limit = int(chunk_size * 1.5)
-
-    for heading_path, block in sections:
-        paragraphs = [p.strip() for p in re.split(r"\n\s*\n", block) if p.strip()]
-        if not paragraphs:
-            continue
-        cur = ""
-        for para in paragraphs:
-            # 单段超长 → 强制硬切（先把累积的吐出去，再分段切这一长段）
-            while len(para) > hard_limit:
-                if cur:
-                    chunks.append({"text": cur, "heading_path": list(heading_path)})
-                    tail = cur[-overlap:] if overlap else ""
-                    cur = ""
-                    head_piece = para[: chunk_size - len(tail)]
-                    chunks.append({"text": tail + head_piece, "heading_path": list(heading_path)})
-                    para = para[chunk_size - len(tail):]
-                else:
-                    chunks.append({"text": para[:chunk_size], "heading_path": list(heading_path)})
-                    para = para[chunk_size - overlap:] if overlap else para[chunk_size:]
-            if not cur:
-                cur = para
-            elif len(cur) + 2 + len(para) <= chunk_size:
-                cur = cur + "\n\n" + para
-            else:
-                chunks.append({"text": cur, "heading_path": list(heading_path)})
-                tail = cur[-overlap:] if overlap else ""
-                cur = (tail + "\n\n" + para) if tail else para
-        if cur:
-            chunks.append({"text": cur, "heading_path": list(heading_path)})
-
-    return chunks
-
-
-class KnowledgeBase:
-    """RAG 知识库封装。
-    存储约定：
-      - collection: CHROMA_COLLECTION_KB
-      - 每个文档 = 一个随机 doc_id，对应 N 个 chunk
-      - chunk id 形如 `<doc_id>_chunk_<index:04d>`，方便 metadata 过滤定位
-      - chunk metadata: {source, doc_id, chunk_index, total_chunks, heading_path?}
-    """
-
-    DEFAULT_CHUNK_SIZE = 800
-    DEFAULT_OVERLAP = 120
-    DEFAULT_WINDOW = 1  # sentence-window 扩展半径（前后各拉 N 片）
-
-    def __init__(self):
-        pass
-
-    def add_document(self, text, source="unknown",
-                     chunk_size=None, overlap=None):
-        """按语义切分长文本并写入 Chroma。返回 doc_id（失败返回 None）。"""
-        if not text or not str(text).strip():
-            return None
-        chunk_size = int(chunk_size) if chunk_size else self.DEFAULT_CHUNK_SIZE
-        overlap = int(overlap) if overlap is not None else self.DEFAULT_OVERLAP
-
-        pieces = _split_markdown_into_chunks(text, chunk_size=chunk_size, overlap=overlap)
-        if not pieces:
-            return None
-
-        doc_id = uuid.uuid4().hex
-        total = len(pieces)
-        ids = [f"{doc_id}_chunk_{i:04d}" for i in range(total)]
-        docs = [p["text"] for p in pieces]
-        metadatas = []
-        for i, p in enumerate(pieces):
-            meta = {
-                "source": str(source),
-                "doc_id": doc_id,
-                "chunk_index": i,
-                "total_chunks": total,
-            }
-            heading = p.get("heading_path") or []
-            if heading:
-                # chroma metadata 标量化：list -> "A > B > C"
-                meta["heading_path"] = " > ".join(str(h) for h in heading)
-            metadatas.append(meta)
-
-        try:
-            chroma_add_documents_sync(CHROMA_COLLECTION_KB, docs, ids, metadatas=metadatas)
-            print(f"[KB] 已写入 source={source!r} doc_id={doc_id} chunks={total}")
-            return doc_id
-        except Exception as e:
-            print("写入知识库失败 (Chroma MCP):", e)
-            return None
-
-    def _expand_window(self, hits, window):
-        """对命中的 (doc_id, chunk_index) 做 sentence-window 扩展。
-
-        返回：dict[(doc_id, chunk_index)] = {text, source, heading}
-              以及 `legacy_hits`（没有 doc_id/chunk_index 的旧数据，不参与扩展）。
-        """
-        from collections import defaultdict
-        wanted = defaultdict(set)  # doc_id -> {chunk_index, ...}
-        legacy = []
-        for h in hits:
-            if h["doc_id"] and h["chunk_index"] is not None:
-                for w in range(-window, window + 1):
-                    idx = h["chunk_index"] + w
-                    if idx >= 0:
-                        wanted[h["doc_id"]].add(idx)
-            else:
-                legacy.append(h)
-
-        expanded = {}
-        for doc_id, idx_set in wanted.items():
-            try:
-                got = chroma_get_documents_sync(
-                    CHROMA_COLLECTION_KB,
-                    where={"$and": [
-                        {"doc_id": {"$eq": doc_id}},
-                        {"chunk_index": {"$in": sorted(idx_set)}},
-                    ]},
-                )
-            except Exception as e:
-                print(f"[KB] 窗口扩展失败 doc_id={doc_id}: {e}")
-                continue
-            if not got:
-                continue
-            g_docs = got.get("documents") or []
-            g_metas = got.get("metadatas") or []
-            for d, m in zip(g_docs, g_metas):
-                if not d or not isinstance(m, dict):
-                    continue
-                ci = m.get("chunk_index")
-                try:
-                    ci = int(ci)
-                except (TypeError, ValueError):
-                    continue
-                expanded[(doc_id, ci)] = {
-                    "text": d,
-                    "source": m.get("source", "unknown"),
-                    "heading": m.get("heading_path", ""),
-                }
-        return expanded, legacy
-
-    def search(self, query, keywords=None, top_k=3, window=None):
-        """检索 + sentence-window 扩展。
-
-        返回 List[str]，每个元素形如 `[source§heading] text1\\n…\\ntext2`，
-        其中同一 doc_id 内相邻 chunk 用 "\\n…\\n" 衔接，方便 LLM 看出"是同一文档的连续段落"。
-        """
-        if not query or not str(query).strip():
-            return []
-        if window is None:
-            window = self.DEFAULT_WINDOW
-
-        q = str(query).strip()
-        if keywords:
-            q = f"{q} {' '.join(str(k) for k in keywords if k)}"
-
-        n_results = max(int(top_k), min(40, int(top_k) * 6))
-        try:
-            data = chroma_query_documents_sync(CHROMA_COLLECTION_KB, [q], n_results=n_results)
-        except Exception as e:
-            print("知识库检索失败 (Chroma MCP):", e)
-            return []
-        if not data:
-            return []
-
-        docs = (data.get("documents") or [[]])[0]
-        metas = (data.get("metadatas") or [[]])[0]
-        ids = (data.get("ids") or [[]])[0]
-
-        hits = []
-        for i, doc in enumerate(docs):
-            if doc is None:
-                continue
-            meta = metas[i] if i < len(metas) and metas[i] else {}
-            if not isinstance(meta, dict):
-                meta = {}
-            doc_id = meta.get("doc_id")
-            chunk_idx = meta.get("chunk_index")
-            try:
-                chunk_idx = int(chunk_idx) if chunk_idx is not None else None
-            except (TypeError, ValueError):
-                chunk_idx = None
-            hits.append({
-                "id": ids[i] if i < len(ids) else None,
-                "doc_id": doc_id,
-                "chunk_index": chunk_idx,
-                "source": meta.get("source", "unknown"),
-                "heading": meta.get("heading_path", ""),
-                "text": doc,
-            })
-
-        if not hits:
-            return []
-
-        # 取一份限量的命中作为 anchor（按 chroma 距离排序，前 top_k 个）
-        anchors = hits[:max(1, int(top_k))]
-
-        expanded, legacy = self._expand_window(anchors, window=window)
-
-        out = []
-        seen_doc = set()
-        for h in anchors:
-            doc_id = h["doc_id"]
-            if doc_id is None or doc_id in seen_doc:
-                continue
-            seen_doc.add(doc_id)
-            indices = sorted(idx for (d, idx) in expanded.keys() if d == doc_id)
-            if not indices:
-                continue
-            label = h["source"] or "unknown"
-            if h["heading"]:
-                label = f"{label}§{h['heading']}"
-            parts = [expanded[(doc_id, ci)]["text"] for ci in indices]
-            joined = "\n…\n".join(parts) if len(parts) > 1 else parts[0]
-            out.append(f"[{label}] {joined}")
-            if len(out) >= top_k:
-                break
-
-        # 旧数据（pet.py 升级前写入、没有 doc_id/chunk_index）：原样返回
-        if len(out) < top_k:
-            for h in legacy:
-                out.append(f"[{h['source']}] {h['text']}")
-                if len(out) >= top_k:
-                    break
-
-        return out
-
-knowledge_base = KnowledgeBase()
-
-# ==================== 智能检索系统 (MemoryRuntime) ====================
-# ---- 召回参数（可调） ----
-# 旧实现 `final_score = sim*10 + imp*0.1` 的问题：
-#   * sim 最高才贡献 10 分；importance 到 600+ 就贡献 60+ 分；
-#   * 每次命中 +5、每天才 -1（且必须 24h 没访问）；
-#   * 结果就是几条 importance 已经爬到 600 的"明星记忆"每轮对话都霸榜，
-#     和当前问题没语义关系也会被反复拉出来 → 冷门记忆永远轮不到 → 饥饿现象。
-# 新策略（chromadb 主导）：
-#   阶段 1：用 Chroma 距离取 sim ≥ MEM_SIM_FLOOR 的候选；连这条都不到的，
-#           不管 importance 多高都直接淘汰，杜绝"靠老本蒙过去"。
-#   阶段 2：把 sim / importance / recency 三个都归一化到 [0, 1]，按权重 0.75 / 0.15 / 0.10
-#           加权，sim 永远占大头，importance 只是 tiebreaker。
-#   降饱和：命中只 +1（原来 +5），且对单条记忆做 LEAST(..., MEM_IMP_CAP) 硬上限 100。
-#   防重复：同一轮会话里刚召回过的 mid，再次计算时打 0.6 折，给冷门记忆出场机会。
-MEM_SIM_FLOOR = 0.45              # _chrom_distance_to_sim 下，对应 d ≲ 1.22；低于此直接丢
-MEM_IMP_CAP = 100.0               # importance_score 硬上限，防止无限刷上去
-MEM_SIM_WEIGHT = 0.75             # 语义相似度权重（主导）
-MEM_IMP_WEIGHT = 0.15             # 重要性权重（次要）
-MEM_RECENCY_WEIGHT = 0.10         # 时间新鲜度权重
-MEM_RECENCY_HALFLIFE_DAYS = 14.0  # 上次访问后，每 14 天 recency 减半
-MEM_RECENT_RECALL_PENALTY = 0.6   # 最近被拉过的同 mid 再次计分时乘 0.6
-MEM_SESSION_DEDUP_WINDOW = 20     # 维护"最近召回 mid"队列的长度
-MEM_RECALL_BUMP = 1               # 召回命中时 importance 增量（原来是 5）
-
-
-class MemoryRuntime:
-    def __init__(self):
-        # 最近召回过的 mysql_id 序列（会话级 dedup，进程重启清空）
-        self._recent_recalls = []
-        self._lock = threading.Lock()
-
-    def _mark_recalled(self, mid):
-        with self._lock:
-            if mid in self._recent_recalls:
-                self._recent_recalls.remove(mid)
-            self._recent_recalls.append(mid)
-            if len(self._recent_recalls) > MEM_SESSION_DEDUP_WINDOW:
-                self._recent_recalls = self._recent_recalls[-MEM_SESSION_DEDUP_WINDOW:]
-
-    def _is_recently_recalled(self, mid):
-        with self._lock:
-            return mid in self._recent_recalls
-
-    def chained_recall(self, query, keywords=None, top_k=5):
-        matched_memories = []
-        if not query or not str(query).strip():
-            return matched_memories
-        q = str(query).strip()
-        if not keywords:
-            if jieba:
-                keywords = list(jieba.cut_for_search(query))
-            else:
-                keywords = list(query)
-        if keywords:
-            q = f"{q} {' '.join(str(k) for k in keywords if k)}"
-
-        # 池子不用太大：现在 sim 是主导，候选多了反而要等更多 sql。
-        n_pool = max(15, min(60, top_k * 8))
-        try:
-            data = chroma_query_documents_sync(CHROMA_COLLECTION_MEM, [q], n_results=n_pool)
-            if not data:
-                return matched_memories
-            docs = (data.get("documents") or [[]])[0]
-            metas = (data.get("metadatas") or [[]])[0]
-            dists = (data.get("distances") or [[]])[0]
-
-            # ---- 阶段 1：纯语义初筛 ----
-            candidates = []
-            for i, doc in enumerate(docs):
-                meta = metas[i] if i < len(metas) and metas[i] else {}
-                mid = None
-                if isinstance(meta, dict):
-                    mid = meta.get("mysql_id")
-                try:
-                    mid = int(mid)
-                except (TypeError, ValueError):
-                    try:
-                        mid = int(float(mid))
-                    except (TypeError, ValueError):
-                        continue
-                d = dists[i] if i < len(dists) else 0.0
-                sim = _chrom_distance_to_sim(d)
-                # 不够像就直接丢，不让"老明星 imp=600"靠 importance 蒙混进 Top-K
-                if sim < MEM_SIM_FLOOR:
-                    continue
-                candidates.append({"id": mid, "content": doc, "sim": sim})
-
-            if not candidates:
-                # 整池子里都没一条 sim ≥ floor → 真的没相关记忆，不返回。
-                # 注意：这种"无相关"情况下绝不能 fallback 去按 importance 取 Top，
-                # 否则又会把那几条明星记忆灌进 prompt（这正是用户截图里的现象）。
-                return matched_memories
-
-            conn = pymysql.connect(
-                host=DB_CONFIG['host'], user=DB_CONFIG['user'],
-                password=DB_CONFIG['password'], database=DB_NAME,
-                charset=DB_CONFIG['charset'], cursorclass=pymysql.cursors.DictCursor
-            )
-            with conn.cursor() as cursor:
-                ids = list({c["id"] for c in candidates})
-                placeholders = ",".join(["%s"] * len(ids))
-                # 顺带把 last_accessed_at 距今多少秒拉出来，做 recency 衰减。
-                cursor.execute(
-                    f"SELECT id, content, importance_score, "
-                    f"  GREATEST(0, TIMESTAMPDIFF(SECOND, last_accessed_at, NOW())) AS sec_ago "
-                    f"FROM user_memory WHERE id IN ({placeholders})",
-                    ids,
-                )
-                rows_by_id = {r["id"]: r for r in cursor.fetchall()}
-
-                # ---- 阶段 2：多因子归一化重排 ----
-                log_cap = math.log1p(MEM_IMP_CAP)
-                sim_span = max(1e-6, 1.0 - MEM_SIM_FLOOR)
-                for c in candidates:
-                    row = rows_by_id.get(c["id"])
-                    if not row:
-                        continue
-                    imp = float(row["importance_score"] or 0.0)
-                    # sim 从 [floor, 1] → [0, 1]，扩大区分度
-                    sim_norm = max(0.0, min(1.0, (c["sim"] - MEM_SIM_FLOOR) / sim_span))
-                    # importance 用 log + cap，把"600 vs 10"这种悬殊压成"1.0 vs 0.52"
-                    imp_norm = math.log1p(min(imp, MEM_IMP_CAP)) / log_cap if log_cap > 0 else 0.0
-                    days_ago = float(row.get("sec_ago") or 0.0) / 86400.0
-                    recency = 0.5 ** (days_ago / MEM_RECENCY_HALFLIFE_DAYS)
-                    score = (
-                        MEM_SIM_WEIGHT * sim_norm
-                        + MEM_IMP_WEIGHT * imp_norm
-                        + MEM_RECENCY_WEIGHT * recency
-                    )
-                    # 同一会话里刚召回过 → 降权，给冷门记忆机会
-                    if self._is_recently_recalled(c["id"]):
-                        score *= MEM_RECENT_RECALL_PENALTY
-                    c["final_score"] = score
-                    c["content"] = row["content"]
-                    c["_debug"] = (c["sim"], sim_norm, imp_norm, recency, imp)
-
-                candidates = [c for c in candidates if "final_score" in c]
-                candidates.sort(key=lambda x: x["final_score"], reverse=True)
-                top_results = candidates[:top_k]
-
-                for row in top_results:
-                    matched_memories.append(row["content"])
-                    self._mark_recalled(row["id"])
-                    # 命中只 +1，且 LEAST(..., MEM_IMP_CAP) 做硬上限。
-                    cursor.execute(
-                        "UPDATE user_memory "
-                        "SET access_count = access_count + 1, "
-                        "    importance_score = LEAST(importance_score + %s, %s), "
-                        "    last_accessed_at = NOW() "
-                        "WHERE id = %s",
-                        (MEM_RECALL_BUMP, MEM_IMP_CAP, row["id"]),
-                    )
-
-                # 调试：把当次 Top-3 的分数构成打出来，方便观察是不是真的 sim 主导。
-                if top_results:
-                    print("[Mem][召回] query=", query[:30])
-                    for r in top_results[:3]:
-                        raw_sim, sn, ino, rec, raw_imp = r.get("_debug", (0, 0, 0, 0, 0))
-                        print(
-                            f"  id={r['id']:>4} final={r['final_score']:.3f}  "
-                            f"sim={raw_sim:.2f}(norm {sn:.2f})  "
-                            f"imp={raw_imp:.0f}(norm {ino:.2f})  "
-                            f"recency={rec:.2f}  -- {str(r['content'])[:32]}"
-                        )
-
-            conn.commit()
-            conn.close()
-        except Exception as db_e:
-            print("记忆检索异常:", db_e)
-
-        return matched_memories
-
-memory_runtime = MemoryRuntime()
-
-# ==================== 对话上下文（最近 N 轮短期记忆） ====================
-class ConversationHistory:
-    """本地短期上下文：最多保留最近 N 轮（用户 + 久远寺有珠）对话，落盘 JSON。
-
-    与 user_memory 的区别：
-      - 这里是"原始最近对话"，不做向量化、不做艾宾浩斯衰减；
-      - 主要给 LLM 在 prompt 里看到最近上下文，避免短期内反复问同一件事；
-      - 超过 max_turns 时按 FIFO 删除最早的一轮。
-    """
-    DEFAULT_MAX_TURNS = 10
-
-    def __init__(self, file_path=None, max_turns=None):
-        if file_path is None:
-            file_path = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)),
-                "conversation_history.json",
-            )
-        self.file_path = file_path
-        self.max_turns = int(max_turns) if max_turns else self.DEFAULT_MAX_TURNS
-        self._lock = threading.Lock()
-        self._turns = self._load()
-
-    def _load(self):
-        if not os.path.exists(self.file_path):
-            return []
-        try:
-            with open(self.file_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if not isinstance(data, list):
-                return []
-            normalized = []
-            for item in data[-self.max_turns:]:
-                if not isinstance(item, dict):
-                    continue
-                u = str(item.get("user", "")).strip()
-                a = str(item.get("assistant", "")).strip()
-                if not u and not a:
-                    continue
-                normalized.append({"user": u, "assistant": a})
-            return normalized
-        except Exception as e:
-            print(f"[ConversationHistory] 加载历史失败: {e}")
-            return []
-
-    def _save_locked(self):
-        try:
-            with open(self.file_path, "w", encoding="utf-8") as f:
-                json.dump(self._turns, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            print(f"[ConversationHistory] 保存历史失败: {e}")
-
-    def add_turn(self, user_text, assistant_text):
-        u = str(user_text or "").strip()
-        a = str(assistant_text or "").strip()
-        if not u and not a:
-            return
-        with self._lock:
-            self._turns.append({"user": u, "assistant": a})
-            if len(self._turns) > self.max_turns:
-                # 多出来的从最早开始丢
-                self._turns = self._turns[-self.max_turns:]
-            self._save_locked()
-
-    def get_turns(self):
-        with self._lock:
-            return list(self._turns)
-
-    def format_for_prompt(self):
-        """格式化为塞进 system prompt 的字符串。无历史返回 "无"。"""
-        with self._lock:
-            turns = list(self._turns)
-        if not turns:
-            return "无"
-        lines = []
-        for t in turns:
-            u = t.get("user", "")
-            a = t.get("assistant", "")
-            if u:
-                lines.append(f"用户: {u}")
-            if a:
-                lines.append(f"久远寺有珠: {a}")
-        return "\n".join(lines)
-
-
-conversation_history = ConversationHistory()
 
 # ==================== 腾讯云 COS 图床配置 ====================
 # 真实值来自 AppConfig。留空时 EmotionCOSManager 会自己降级（不发表情包），
@@ -1225,7 +242,8 @@ from PyQt5.QtWidgets import (
     QCheckBox, QMessageBox, QMenu, QScrollArea, QDesktopWidget,
     QGraphicsDropShadowEffect, QFileDialog, QFrame, QComboBox,
     QSizePolicy, QStackedWidget, QDialog, QFormLayout, QSpinBox,
-    QPlainTextEdit, QSplitter
+    QPlainTextEdit, QTextEdit, QSplitter, QTabWidget, QTableWidget,
+    QTableWidgetItem, QHeaderView, QAbstractItemView, QProgressBar
 )
 from PyQt5.QtCore import (
     Qt, QPoint, QTimer, QSize, QThread, pyqtSignal, QObject,
@@ -1235,6 +253,59 @@ from PyQt5.QtGui import (
     QPixmap, QPainter, QFont, QColor, QPolygon, QMovie, QIcon,
     QLinearGradient, QBrush, QPen
 )
+from pet_services.tts_service import (
+    TTSSynthThread,
+    cleanup_tts_artifacts,
+    configure_tts,
+    play_tts_file,
+    reset_tts_client_state,
+)
+
+
+def apply_dark_window_chrome(widget):
+    """Make native Windows title bars match the app's dark theme when available."""
+    try:
+        pixmap = QPixmap(1, 1)
+        pixmap.fill(Qt.transparent)
+        widget.setWindowIcon(QIcon(pixmap))
+    except Exception:
+        pass
+
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        hwnd = int(widget.winId())
+        dwmapi = ctypes.windll.dwmapi
+        enabled = ctypes.c_int(1)
+        for attr in (20, 19):  # DWMWA_USE_IMMERSIVE_DARK_MODE; older fallback
+            try:
+                dwmapi.DwmSetWindowAttribute(
+                    hwnd, attr, ctypes.byref(enabled), ctypes.sizeof(enabled)
+                )
+            except Exception:
+                pass
+
+        def colorref(hex_color):
+            h = hex_color.lstrip("#")
+            r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+            return ctypes.c_int(r | (g << 8) | (b << 16))
+
+        for attr, color in (
+            (35, "#050607"),  # DWMWA_CAPTION_COLOR
+            (36, "#F1EBDD"),  # DWMWA_TEXT_COLOR
+            (34, "#273546"),  # DWMWA_BORDER_COLOR
+        ):
+            value = colorref(color)
+            try:
+                dwmapi.DwmSetWindowAttribute(
+                    hwnd, attr, ctypes.byref(value), ctypes.sizeof(value)
+                )
+            except Exception:
+                pass
+    except Exception:
+        pass
+
 
 # ark_api_key 已经在文件顶部声明，apply_config_to_globals() 会从 AppConfig 注入。
 # 这里再 sync 一次，覆盖掉 import 时还没载入 AppConfig 的占位值（"" → 真实 key）。
@@ -1248,45 +319,110 @@ ark_api_key = app_config.get("ark.api_key", "") or ""
 class SettingsWindow(QDialog):
     def __init__(self, parent=None, highlight_section=None):
         super().__init__(parent)
-        self.setWindowTitle("⚙ 桌宠设置")
+        self.setWindowTitle("桌宠设置")
+        apply_dark_window_chrome(self)
         self.resize(780, 560)
         self.setStyleSheet("""
-            QDialog { background: #FFF8E7; }
-            QListWidget {
-                background: #FFE8C4; border: none; padding: 6px;
-                font-size: 14px; outline: 0;
+            QDialog {
+                background: #050607;
+                color: #F1EBDD;
+                font-family: "Microsoft YaHei";
             }
-            QListWidget::item { padding: 10px 12px; border-radius: 6px; }
-            QListWidget::item:selected { background: #FFB347; color: white; }
+            QWidget { background: #050607; color: #F1EBDD; }
+            QListWidget {
+                background: #07090D;
+                color: #A8B8C9;
+                border: none;
+                border-right: 1px solid #273546;
+                padding: 8px;
+                font-size: 13px;
+                outline: 0;
+            }
+            QListWidget::item {
+                padding: 10px 12px;
+                border-radius: 7px;
+                margin: 2px 0;
+            }
+            QListWidget::item:hover {
+                background: #101724;
+                color: #F1EBDD;
+            }
+            QListWidget::item:selected {
+                background: #20162E;
+                color: #F1EBDD;
+                border: 1px solid #775E90;
+            }
             QLineEdit, QSpinBox, QPlainTextEdit {
-                background: white; border: 1px solid #DDD; border-radius: 5px;
-                padding: 6px 8px; font-size: 13px;
+                background: #07090D;
+                color: #F1EBDD;
+                border: 1px solid #6F879B;
+                border-radius: 6px;
+                padding: 7px 9px;
+                font-size: 13px;
+                selection-background-color: #34224A;
             }
             QLineEdit:focus, QSpinBox:focus, QPlainTextEdit:focus {
-                border: 1px solid #FFB347;
+                border: 1px solid #9FB7CC;
+                background: #090C12;
             }
-            QLabel#desc { color: #555; font-size: 12px; }
-            QLabel#hint { color: #888; font-size: 11px; font-style: italic; }
-            QLabel#title { font-size: 17px; font-weight: bold; color: #333; }
+            QLabel#desc { color: #A8AEB8; font-size: 12px; }
+            QLabel#hint { color: #6F879B; font-size: 11px; font-style: italic; }
+            QLabel#title { font-size: 17px; font-weight: 300; color: #9FB7CC; }
             QPushButton {
-                background: #FFB347; color: white; border: none;
-                border-radius: 6px; padding: 8px 18px; font-weight: bold;
+                background: #1E2B3A;
+                color: #F1EBDD;
+                border: 1px solid #6F879B;
+                border-radius: 7px;
+                padding: 8px 18px;
+                font-weight: 500;
             }
-            QPushButton:hover { background: #FF9F1F; }
+            QPushButton:hover {
+                background: #2A3A4E;
+                border-color: #9FB7CC;
+            }
             QPushButton[role="ghost"] {
-                background: transparent; color: #666; border: 1px solid #CCC;
+                background: transparent;
+                color: #C6D4E2;
+                border: 1px solid #46586B;
             }
-            QPushButton[role="ghost"]:hover { background: #EEE; color: #333; }
+            QPushButton[role="ghost"]:hover {
+                background: #101724;
+                color: #F1EBDD;
+                border-color: #9FB7CC;
+            }
             QPushButton[role="eye"] {
-                background: transparent; color: #888; border: none;
+                background: transparent;
+                color: #9FB7CC;
+                border: none;
                 padding: 0px; font-size: 14px;
             }
-            QPushButton[role="eye"]:hover { color: #FFB347; }
+            QPushButton[role="eye"]:hover { color: #F1EBDD; }
             QPushButton[role="picker"] {
-                background: #EEE; color: #555; border: 1px solid #CCC;
-                padding: 4px 10px; font-weight: normal;
+                background: #07090D;
+                color: #C6D4E2;
+                border: 1px solid #46586B;
+                padding: 5px 11px;
+                font-weight: normal;
             }
-            QPushButton[role="picker"]:hover { background: #DDD; }
+            QPushButton[role="picker"]:hover {
+                background: #101724;
+                border-color: #9FB7CC;
+            }
+            QScrollArea { background: transparent; border: none; }
+            QScrollBar:vertical {
+                background: #050607;
+                width: 8px;
+                margin: 0;
+            }
+            QScrollBar::handle:vertical {
+                background: #46586B;
+                border-radius: 4px;
+                min-height: 24px;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0;
+                border: none;
+            }
         """)
 
         # field_key (str like "mysql.password") → QWidget（输入控件）
@@ -1304,13 +440,13 @@ class SettingsWindow(QDialog):
         self.cat_list = QListWidget()
         self.cat_list.setFixedWidth(180)
         for section in CONFIG_SCHEMA:
-            item = QListWidgetItem(f" {section.get('icon', '')}  {section['title']}")
+            item = QListWidgetItem(section['title'])
             self.cat_list.addItem(item)
         self.cat_list.currentRowChanged.connect(self._on_cat_changed)
 
         # 右侧堆叠
         self.stack = QStackedWidget()
-        self.stack.setStyleSheet("background: #FFF8E7;")
+        self.stack.setStyleSheet("background: #050607;")
         for section in CONFIG_SCHEMA:
             page = self._build_section_page(section)
             self.stack.addWidget(page)
@@ -1323,10 +459,10 @@ class SettingsWindow(QDialog):
         footer = QHBoxLayout()
         footer.setContentsMargins(15, 10, 15, 15)
         self.status_label = QLabel("")
-        self.status_label.setStyleSheet("color: #C62828; font-size: 12px;")
+        self.status_label.setStyleSheet("color: #B7A6D8; font-size: 12px;")
         footer.addWidget(self.status_label, 1)
 
-        btn_reset = QPushButton("↺ 恢复默认")
+        btn_reset = QPushButton("恢复默认")
         btn_reset.setProperty("role", "ghost")
         btn_reset.clicked.connect(self._on_reset_clicked)
 
@@ -1334,7 +470,7 @@ class SettingsWindow(QDialog):
         btn_cancel.setProperty("role", "ghost")
         btn_cancel.clicked.connect(self.reject)
 
-        btn_save = QPushButton("💾 保存")
+        btn_save = QPushButton("保存")
         btn_save.clicked.connect(self._on_save_clicked)
 
         footer.addWidget(btn_reset)
@@ -1351,6 +487,10 @@ class SettingsWindow(QDialog):
                     break
         self.cat_list.setCurrentRow(target_row)
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        apply_dark_window_chrome(self)
+
     # ---------- 构造每个分类的表单 ----------
     def _build_section_page(self, section):
         page = QWidget()
@@ -1358,7 +498,7 @@ class SettingsWindow(QDialog):
         v.setContentsMargins(24, 20, 24, 20)
         v.setSpacing(14)
 
-        title = QLabel(f"{section.get('icon', '')}  {section['title']}")
+        title = QLabel(section['title'])
         title.setObjectName("title")
         v.addWidget(title)
 
@@ -1390,7 +530,7 @@ class SettingsWindow(QDialog):
             if field.get("required"):
                 label_text += " *"
             label = QLabel(label_text)
-            label.setStyleSheet("font-size: 13px; color: #333;")
+            label.setStyleSheet("font-size: 13px; color: #C6D4E2;")
             form.addRow(label, row_widget)
 
         form_holder.setWidget(form_widget)
@@ -1557,10 +697,7 @@ class SettingsWindow(QDialog):
         except Exception as e:
             print(f"[Settings] 重建 cos_manager 失败：{e}")
         try:
-            # TTSClient 内部有"权重已切过"标记，重置一下，下次合成会重新 set_xxx_weights
-            tts = globals().get("tts_client")
-            if tts is not None and hasattr(tts, "_weights_set"):
-                tts._weights_set = False
+            reset_tts_client_state()
         except Exception as e:
             print(f"[Settings] 重置 TTS weights 标记失败：{e}")
 
@@ -1626,88 +763,837 @@ def ensure_required_config_or_prompt(parent=None):
         # 循环回去再检查一次
 
 
-# ==================== 长期记忆管理 ====================
-def init_db():
-    try:
-        # 连接时不指定 database，以防数据库还未创建
-        conn = pymysql.connect(host=DB_CONFIG['host'], user=DB_CONFIG['user'], password=DB_CONFIG['password'], charset=DB_CONFIG['charset'])
-        with conn.cursor() as cursor:
-            cursor.execute(f"CREATE DATABASE IF NOT EXISTS {DB_NAME} DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
-        conn.commit()
-        conn.select_db(DB_NAME)
-        
-        with conn.cursor() as cursor:
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS user_memory (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
-                    content VARCHAR(500) NOT NULL,
-                    keywords VARCHAR(200),
-                    importance_score FLOAT DEFAULT 10.0,
-                    access_count INT DEFAULT 1,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    last_accessed_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS knowledge_base (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
-                    content TEXT NOT NULL,
-                    source VARCHAR(255),
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print("数据库初始化失败 (请检查 MySQL 是否启动及密码是否正确):", e)
-
-def daily_decay_memory():
-    """艾宾浩斯遗忘衰减：每天执行一次。
-       1) 凡是高于 MEM_IMP_CAP 的旧明星记忆，先一次性拉回 cap（迁移老数据用，免得 -1/天 要扣几百天）；
-       2) 距今超过 1 天未访问的记忆，每天扣权重：高分项 -2、其他 -1，避免热门记忆赖着不衰减；
-       3) importance ≤ 0 的彻底遗忘（连同 Chroma 一起删）。
-    """
-    try:
-        conn = pymysql.connect(host=DB_CONFIG['host'], user=DB_CONFIG['user'], password=DB_CONFIG['password'], database=DB_NAME, charset=DB_CONFIG['charset'])
-        dead_ids = []
-        with conn.cursor() as cursor:
-            # 1) 把历史遗留的 imp > cap 的项直接 clamp 回 cap
-            cursor.execute(
-                "UPDATE user_memory SET importance_score = %s WHERE importance_score > %s",
-                (MEM_IMP_CAP, MEM_IMP_CAP),
-            )
-            # 2) 一天没碰过 → 衰减；imp ≥ 50 的衰减更狠，给冷门记忆流动空间
-            cursor.execute(
-                "UPDATE user_memory "
-                "SET importance_score = importance_score - "
-                "    CASE WHEN importance_score >= 50 THEN 2 ELSE 1 END "
-                "WHERE DATEDIFF(NOW(), last_accessed_at) >= 1"
-            )
-            # 3) 收尸
-            cursor.execute("SELECT id FROM user_memory WHERE importance_score <= 0")
-            dead_ids = [row[0] for row in cursor.fetchall()]
-            cursor.execute("DELETE FROM user_memory WHERE importance_score <= 0")
-        conn.commit()
-        conn.close()
-        if dead_ids:
-            try:
-                chroma_delete_documents_sync(
-                    CHROMA_COLLECTION_MEM,
-                    [f"mem_{i}" for i in dead_ids],
-                )
-            except Exception as ce:
-                print("遗忘时同步删除 Chroma 记忆失败:", ce)
-    except Exception as e:
-        print("记忆衰减执行失败:", e)
 
 # ==================== 桌宠主体 ====================
+class MemoryManagerWindow(QWidget):
+    """Audit and edit short-term memory, long-term memory, and user profile."""
+
+    def __init__(self, pet=None):
+        super().__init__()
+        self.pet = pet
+        self.current_rows = []
+        self.setWindowTitle("记忆管理")
+        apply_dark_window_chrome(self)
+        self.resize(980, 680)
+        self.init_ui()
+        self.refresh()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        apply_dark_window_chrome(self)
+
+    def init_ui(self):
+        self.setStyleSheet("""
+            QWidget { background: #050607; color: #F1EBDD; font-family: "Microsoft YaHei"; }
+            QLabel { background: transparent; color: #A8B8C9; }
+            QLineEdit, QPlainTextEdit, QComboBox {
+                background: #07090D;
+                color: #F1EBDD;
+                border: 1px solid #6F879B;
+                border-radius: 6px;
+                padding: 7px 9px;
+                font-size: 13px;
+                selection-background-color: #34224A;
+            }
+            QLineEdit:focus, QPlainTextEdit:focus, QComboBox:focus {
+                border-color: #9FB7CC;
+                background: #090C12;
+            }
+            QComboBox::drop-down { width: 18px; border: none; }
+            QPushButton {
+                background: #1E2B3A;
+                color: #F1EBDD;
+                border: 1px solid #6F879B;
+                border-radius: 7px;
+                padding: 7px 13px;
+                font-weight: 500;
+            }
+            QPushButton:hover {
+                background: #2A3A4E;
+                border-color: #9FB7CC;
+            }
+            QPushButton[role="danger"] {
+                background: #34224A;
+                border-color: #775E90;
+                color: #F1EBDD;
+            }
+            QPushButton[role="danger"]:hover { background: #473160; }
+            QPushButton[role="ghost"] {
+                background: transparent;
+                color: #C6D4E2;
+                border: 1px solid #46586B;
+            }
+            QTableWidget {
+                background: #050607;
+                alternate-background-color: #10131A;
+                color: #F1EBDD;
+                border: 1px solid #46586B;
+                border-radius: 8px;
+                gridline-color: #171B24;
+                selection-background-color: rgba(159, 183, 204, 58);
+                selection-color: #FFFFFF;
+            }
+            QHeaderView::section {
+                background: #20162E;
+                color: #F1EBDD;
+                border: none;
+                border-right: 1px solid #34224A;
+                padding: 7px;
+                font-weight: 600;
+            }
+            QScrollBar:vertical {
+                background: #050607;
+                width: 8px;
+                margin: 0;
+            }
+            QScrollBar::handle:vertical {
+                background: #46586B;
+                border-radius: 4px;
+                min-height: 24px;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0;
+                border: none;
+            }
+        """)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(10)
+
+        header = QHBoxLayout()
+        title = QLabel("记忆管理")
+        title.setFont(QFont("Microsoft YaHei", 17, QFont.Light))
+        title.setStyleSheet("color: #9FB7CC; letter-spacing: 0px;")
+        header.addWidget(title)
+        header.addStretch()
+        refresh_profile_btn = QPushButton("刷新画像")
+        refresh_profile_btn.setToolTip("重新从长期记忆聚合用户画像")
+        refresh_profile_btn.clicked.connect(self.refresh_profile)
+        header.addWidget(refresh_profile_btn)
+        refine_pending_btn = QPushButton("精炼未处理")
+        refine_pending_btn.setToolTip("最多处理 10 条还没进入 Profile Refiner 的长期记忆；会调用画像精炼模型")
+        refine_pending_btn.clicked.connect(self.refine_pending_memories)
+        header.addWidget(refine_pending_btn)
+        root.addLayout(header)
+
+        filters = QHBoxLayout()
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("短期记忆", "short")
+        self.mode_combo.addItem("长期记忆", "long")
+        self.mode_combo.addItem("用户画像", "profile")
+        self.mode_combo.currentIndexChanged.connect(self.refresh)
+        filters.addWidget(self.mode_combo)
+
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("搜索内容、关键词、分类...")
+        self.search_input.returnPressed.connect(self.refresh)
+        filters.addWidget(self.search_input, 1)
+
+        refresh_btn = QPushButton("搜索/刷新")
+        refresh_btn.clicked.connect(self.refresh)
+        filters.addWidget(refresh_btn)
+        root.addLayout(filters)
+
+        splitter = QSplitter(Qt.Vertical)
+        root.addWidget(splitter, 1)
+
+        self.table = QTableWidget()
+        self.table.setAlternatingRowColors(True)
+        self.table.setShowGrid(False)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.itemSelectionChanged.connect(self.on_selection_changed)
+        splitter.addWidget(self.table)
+
+        editor = QWidget()
+        editor_layout = QVBoxLayout(editor)
+        editor_layout.setContentsMargins(0, 8, 0, 0)
+        editor_layout.setSpacing(8)
+
+        meta_row = QHBoxLayout()
+        self.selected_label = QLabel("未选择")
+        self.selected_label.setStyleSheet("color: #A8AEB8;")
+        meta_row.addWidget(self.selected_label)
+        meta_row.addStretch()
+        meta_row.addWidget(QLabel("分类/字段"))
+        self.category_input = QLineEdit()
+        self.category_input.setPlaceholderText("长期记忆分类或画像字段")
+        self.category_input.setMaximumWidth(220)
+        meta_row.addWidget(self.category_input)
+        meta_row.addWidget(QLabel("关键词"))
+        self.keywords_input = QLineEdit()
+        self.keywords_input.setPlaceholderText("短期/长期关键词")
+        self.keywords_input.setMaximumWidth(240)
+        meta_row.addWidget(self.keywords_input)
+        editor_layout.addLayout(meta_row)
+
+        self.detail_edit = QPlainTextEdit()
+        self.detail_edit.setPlaceholderText("选中一条记忆后可以在这里编辑正文/画像内容。")
+        editor_layout.addWidget(self.detail_edit, 1)
+
+        buttons = QHBoxLayout()
+        self.clear_btn = QPushButton("清空表单")
+        self.clear_btn.setProperty("role", "ghost")
+        self.clear_btn.clicked.connect(self.clear_form)
+        buttons.addWidget(self.clear_btn)
+
+        self.add_btn = QPushButton("添加新项")
+        self.add_btn.clicked.connect(self.add_new)
+        buttons.addWidget(self.add_btn)
+
+        self.save_btn = QPushButton("保存修改")
+        self.save_btn.clicked.connect(self.save_selected)
+        buttons.addWidget(self.save_btn)
+
+        self.promote_btn = QPushButton("迁移为长期记忆")
+        self.promote_btn.setToolTip("只对短期记忆有效：写入长期记忆后从短期表和 Chroma 删除")
+        self.promote_btn.clicked.connect(self.promote_selected)
+        buttons.addWidget(self.promote_btn)
+
+        self.delete_btn = QPushButton("删除选中")
+        self.delete_btn.setProperty("role", "danger")
+        self.delete_btn.clicked.connect(self.delete_selected)
+        buttons.addWidget(self.delete_btn)
+
+        buttons.addStretch()
+        close_btn = QPushButton("关闭")
+        close_btn.setProperty("role", "ghost")
+        close_btn.clicked.connect(self.close)
+        buttons.addWidget(close_btn)
+        editor_layout.addLayout(buttons)
+
+        splitter.addWidget(editor)
+        splitter.setSizes([420, 220])
+
+    def _connect_db(self):
+        return pymysql.connect(
+            host=DB_CONFIG['host'], user=DB_CONFIG['user'],
+            password=DB_CONFIG['password'], database=DB_NAME,
+            charset=DB_CONFIG['charset'], cursorclass=pymysql.cursors.DictCursor
+        )
+
+    def _mode(self):
+        return self.mode_combo.currentData() or "short"
+
+    def refresh(self):
+        mode = self._mode()
+        q = self.search_input.text().strip()
+        self.current_rows = []
+        conn = None
+        try:
+            conn = self._connect_db()
+            with conn.cursor() as cursor:
+                like = f"%{q}%"
+                if mode == "short":
+                    sql = (
+                        "SELECT id, content, keywords, importance_score, access_count, "
+                        "created_at, last_accessed_at FROM user_memory "
+                    )
+                    args = []
+                    if q:
+                        sql += "WHERE content LIKE %s OR keywords LIKE %s "
+                        args.extend([like, like])
+                    sql += "ORDER BY importance_score DESC, last_accessed_at DESC LIMIT 300"
+                    cursor.execute(sql, args)
+                elif mode == "long":
+                    sql = (
+                        "SELECT id, source_memory_id, content, keywords, category, importance_score, "
+                        "promote_reason, promoted_at FROM long_term_memory "
+                    )
+                    args = []
+                    if q:
+                        sql += "WHERE content LIKE %s OR keywords LIKE %s OR category LIKE %s "
+                        args.extend([like, like, like])
+                    sql += "ORDER BY promoted_at DESC, importance_score DESC LIMIT 300"
+                    cursor.execute(sql, args)
+                else:
+                    _refresh_user_profile_from_claims(cursor, clear_when_empty=True)
+                    sql = (
+                        "SELECT id, field_name, claim, confidence, evidence_count, updated_at "
+                        "FROM profile_claim "
+                    )
+                    args = []
+                    if q:
+                        sql += "WHERE field_name LIKE %s OR claim LIKE %s "
+                        args.extend([like, like])
+                    sql += "ORDER BY confidence DESC, updated_at DESC"
+                    cursor.execute(sql, args)
+                self.current_rows = list(cursor.fetchall())
+            conn.commit()
+        except Exception as e:
+            QMessageBox.warning(self, "读取失败", f"读取记忆失败：{e}")
+            self.current_rows = []
+        finally:
+            try:
+                if conn:
+                    conn.close()
+            except Exception:
+                pass
+        self.populate_table()
+        self.on_selection_changed()
+
+    def populate_table(self):
+        mode = self._mode()
+        if mode == "short":
+            columns = ["id", "score", "access", "content", "keywords", "last_accessed"]
+        elif mode == "long":
+            columns = ["id", "category", "score", "content", "reason", "promoted_at"]
+        else:
+            columns = ["id", "field", "confidence", "evidence", "claim", "updated_at"]
+
+        self.table.clear()
+        self.table.setColumnCount(len(columns))
+        self.table.setHorizontalHeaderLabels(columns)
+        self.table.setRowCount(len(self.current_rows))
+
+        for r, row in enumerate(self.current_rows):
+            if mode == "short":
+                values = [
+                    row.get("id"), row.get("importance_score"), row.get("access_count"),
+                    row.get("content"), row.get("keywords"), row.get("last_accessed_at"),
+                ]
+            elif mode == "long":
+                values = [
+                    row.get("id"), row.get("category"), row.get("importance_score"),
+                    row.get("content"), row.get("promote_reason"), row.get("promoted_at"),
+                ]
+            else:
+                values = [
+                    row.get("id"), row.get("field_name"), row.get("confidence"),
+                    row.get("evidence_count"), row.get("claim"), row.get("updated_at"),
+                ]
+            for c, value in enumerate(values):
+                item = QTableWidgetItem("" if value is None else str(value))
+                item.setData(Qt.UserRole, row)
+                item.setForeground(QBrush(QColor("#F1EBDD")))
+                if r % 2:
+                    item.setBackground(QBrush(QColor("#10131A")))
+                else:
+                    item.setBackground(QBrush(QColor("#050607")))
+                self.table.setItem(r, c, item)
+
+        self.table.resizeColumnsToContents()
+        if self.table.columnCount() > 3:
+            stretch_col = 4 if mode == "profile" else 3
+            self.table.horizontalHeader().setSectionResizeMode(stretch_col, QHeaderView.Stretch)
+        self.promote_btn.setEnabled(mode == "short")
+        self.keywords_input.setEnabled(mode != "profile")
+        self.category_input.setEnabled(mode != "short")
+
+    def selected_row(self):
+        indexes = self.table.selectionModel().selectedRows()
+        if not indexes:
+            return None
+        r = indexes[0].row()
+        if 0 <= r < len(self.current_rows):
+            return self.current_rows[r]
+        return None
+
+    def on_selection_changed(self):
+        row = self.selected_row()
+        mode = self._mode()
+        if not row:
+            self.selected_label.setText("未选择")
+            self.detail_edit.setPlainText("")
+            self.category_input.setText("")
+            self.keywords_input.setText("")
+            return
+        if mode == "short":
+            self.selected_label.setText(f"短期记忆 #{row.get('id')}")
+            self.detail_edit.setPlainText(str(row.get("content") or ""))
+            self.category_input.setText("")
+            self.keywords_input.setText(str(row.get("keywords") or ""))
+        elif mode == "long":
+            self.selected_label.setText(f"长期记忆 #{row.get('id')}")
+            self.detail_edit.setPlainText(str(row.get("content") or ""))
+            self.category_input.setText(str(row.get("category") or ""))
+            self.keywords_input.setText(str(row.get("keywords") or ""))
+        else:
+            self.selected_label.setText(f"用户画像 claim #{row.get('id')}")
+            self.detail_edit.setPlainText(str(row.get("claim") or ""))
+            self.category_input.setText(str(row.get("field_name") or ""))
+            self.keywords_input.setText("")
+
+    def save_selected(self):
+        row = self.selected_row()
+        if not row:
+            return
+        mode = self._mode()
+        content = self.detail_edit.toPlainText().strip()
+        category = self.category_input.text().strip()
+        keywords = self.keywords_input.text().strip()
+        if mode == "profile" and _is_bad_profile_claim(category, content):
+            QMessageBox.warning(self, "画像内容不合适", "这条内容更像应用/角色设定或过度推断，不适合作为用户画像。")
+            return
+        conn = None
+        try:
+            conn = self._connect_db()
+            with conn.cursor() as cursor:
+                if mode == "short":
+                    cursor.execute(
+                        "UPDATE user_memory SET content = %s, keywords = %s WHERE id = %s",
+                        (content, keywords, row.get("id")),
+                    )
+                    chroma_ok_after_commit = (
+                        row.get("id"),
+                        content,
+                        float(row.get("importance_score") or 0),
+                    )
+                elif mode == "long":
+                    cursor.execute(
+                        "UPDATE long_term_memory SET content = %s, keywords = %s, category = %s WHERE id = %s",
+                        (content, keywords, category or _profile_bucket_for_memory(content), row.get("id")),
+                    )
+                else:
+                    field = _normalize_profile_category(category or row.get("field_name"), content)
+                    claim = _clean_profile_claim_text(content)
+                    cursor.execute(
+                        "UPDATE profile_claim SET field_name = %s, claim = %s, confidence = %s, updated_at = NOW() "
+                        "WHERE id = %s",
+                        (field, claim, 1.0, row.get("id")),
+                    )
+                    _refresh_user_profile_from_claims(cursor, clear_when_empty=True)
+            conn.commit()
+            if mode == "short" and 'chroma_ok_after_commit' in locals():
+                mid, synced_content, synced_score = chroma_ok_after_commit
+                if not sync_short_memory_to_chroma(mid, synced_content, synced_score):
+                    QMessageBox.warning(self, "Chroma 同步失败", "MySQL 已保存，但 Chroma 同步失败。")
+            if mode == "long":
+                delete_profile_evidence_for_source("long_term_memory_edit", row.get("id"))
+                schedule_profile_refine(
+                    content,
+                    source_type="long_term_memory",
+                    source_ref=row.get("id"),
+                    category_hint=category or _profile_bucket_for_memory(content),
+                )
+            QMessageBox.information(self, "已保存", "修改已经保存。")
+            self.refresh()
+        except Exception as e:
+            QMessageBox.warning(self, "保存失败", f"保存失败：{e}")
+        finally:
+            try:
+                if conn:
+                    conn.close()
+            except Exception:
+                pass
+
+    def clear_form(self):
+        self.table.clearSelection()
+        self.selected_label.setText("新建")
+        self.detail_edit.setPlainText("")
+        self.category_input.setText("")
+        self.keywords_input.setText("")
+
+    def add_new(self):
+        mode = self._mode()
+        content = self.detail_edit.toPlainText().strip()
+        category = self.category_input.text().strip()
+        keywords = self.keywords_input.text().strip()
+        if not content:
+            QMessageBox.warning(self, "内容为空", "请先在下方文本框填写要添加的记忆内容。")
+            return
+        if mode == "profile" and _is_bad_profile_claim(category, content):
+            QMessageBox.warning(self, "画像内容不合适", "这条内容更像应用/角色设定或过度推断，不适合作为用户画像。")
+            return
+
+        conn = None
+        saved_id = None
+        try:
+            conn = self._connect_db()
+            with conn.cursor() as cursor:
+                if mode == "short":
+                    initial_score = _initial_importance_for_memory(content)
+                    cursor.execute(
+                        "INSERT INTO user_memory (content, keywords, importance_score) VALUES (%s, %s, %s)",
+                        (content, keywords, initial_score),
+                    )
+                    saved_id = cursor.lastrowid
+                elif mode == "long":
+                    long_category = category or _profile_bucket_for_memory(content)
+                    cursor.execute(
+                        "INSERT INTO long_term_memory "
+                        "(source_memory_id, content, content_hash, keywords, category, importance_score, promote_reason) "
+                        "VALUES (NULL, %s, SHA2(%s, 256), %s, %s, %s, 'manual')",
+                        (content, content, keywords, long_category, MEM_PROMOTE_TO_LONG_TERM_SCORE),
+                    )
+                    saved_id = cursor.lastrowid
+                else:
+                    field = _normalize_profile_category(category, content) if category else _profile_bucket_for_memory(content)
+                    claim = _clean_profile_claim_text(content)
+                    cursor.execute(
+                        "INSERT INTO profile_claim "
+                        "(field_name, claim, confidence, evidence_count, evidence_ids) "
+                        "VALUES (%s, %s, 1.0, 1, NULL)",
+                        (field, claim),
+                    )
+                    saved_id = cursor.lastrowid
+                    _refresh_user_profile_from_claims(cursor, clear_when_empty=True)
+            conn.commit()
+
+            if mode == "short" and saved_id:
+                if not sync_short_memory_to_chroma(
+                    saved_id,
+                    content,
+                    _initial_importance_for_memory(content),
+                ):
+                    QMessageBox.warning(
+                        self,
+                        "Chroma 同步失败",
+                        "短期记忆已写入 MySQL，但写入 Chroma 失败。",
+                    )
+            elif mode == "long":
+                schedule_profile_refine(
+                    content,
+                    source_type="long_term_memory",
+                    source_ref=saved_id,
+                    category_hint=category or _profile_bucket_for_memory(content),
+                )
+
+            QMessageBox.information(self, "已添加", "新项已经添加。")
+            self.refresh()
+        except Exception as e:
+            QMessageBox.warning(self, "添加失败", f"添加失败：{e}")
+        finally:
+            try:
+                if conn:
+                    conn.close()
+            except Exception:
+                pass
+
+    def delete_selected(self):
+        row = self.selected_row()
+        if not row:
+            return
+        mode = self._mode()
+        reply = QMessageBox.question(
+            self, "确认删除", "确定删除选中的记忆/画像字段吗？",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+        conn = None
+        try:
+            conn = self._connect_db()
+            with conn.cursor() as cursor:
+                if mode == "short":
+                    mid = int(row.get("id"))
+                    cursor.execute("DELETE FROM user_memory WHERE id = %s", (mid,))
+                    chroma_delete_after_commit = mid
+                elif mode == "long":
+                    long_id = row.get("id")
+                    cursor.execute("DELETE FROM long_term_memory WHERE id = %s", (long_id,))
+                else:
+                    cursor.execute("DELETE FROM profile_claim WHERE id = %s", (row.get("id"),))
+                    _refresh_user_profile_from_claims(cursor, clear_when_empty=True)
+            conn.commit()
+            if mode == "short" and 'chroma_delete_after_commit' in locals():
+                if not delete_short_memory_from_chroma(chroma_delete_after_commit):
+                    QMessageBox.warning(self, "Chroma 同步失败", "MySQL 已删除，但 Chroma 删除失败。")
+            if mode == "long":
+                delete_profile_evidence_for_source("long_term_memory", long_id)
+                delete_profile_evidence_for_source("long_term_memory_edit", long_id)
+                refresh_user_profile_from_long_term(force=True)
+            self.refresh()
+        except Exception as e:
+            QMessageBox.warning(self, "删除失败", f"删除失败：{e}")
+        finally:
+            try:
+                if conn:
+                    conn.close()
+            except Exception:
+                pass
+
+    def promote_selected(self):
+        row = self.selected_row()
+        if not row or self._mode() != "short":
+            return
+        ok = promote_memory_to_long_term(row.get("id"), reason="manual")
+        if ok:
+            QMessageBox.information(self, "已迁移", "已迁移为长期记忆，并从短期记忆中移除。")
+        else:
+            QMessageBox.information(self, "未迁移", "没有迁移：可能已经迁移过，或短期记忆不存在。")
+        self.refresh()
+
+    def refresh_profile(self):
+        refresh_user_profile_from_long_term(force=True)
+        if self._mode() == "profile":
+            self.refresh()
+        QMessageBox.information(self, "已刷新", "用户画像已根据长期记忆重新聚合。")
+
+    def refine_pending_memories(self):
+        if not _profile_refiner_enabled():
+            QMessageBox.information(
+                self,
+                "画像精炼未启用",
+                "请先在设置里填写用户画像精炼模型的 API Key；未启用时不会消耗 tokens。",
+            )
+            return
+        schedule_refine_unprocessed_long_term_memories(limit=10)
+        QMessageBox.information(self, "已开始", "已在后台开始精炼最多 10 条未处理长期记忆。")
+
+
+class FocusTimerWindow(QWidget):
+    def __init__(self, pet):
+        super().__init__()
+        self.pet = pet
+        self.is_collapsed = False
+        self._expanded_geometry = None
+        self.setWindowTitle("专注定时器")
+        apply_dark_window_chrome(self)
+        self.resize(320, 220)
+        self.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
+        self.setStyleSheet("""
+            QWidget {
+                background: #050607;
+                color: #F1EBDD;
+                font-family: "Microsoft YaHei";
+            }
+            QLabel#timerDisplay {
+                background: #07090D;
+                color: #F1EBDD;
+                border: 1px solid #6F879B;
+                border-radius: 8px;
+                font-size: 34px;
+                font-weight: 600;
+                padding: 14px;
+            }
+            QLabel#fieldLabel {
+                color: #9FB7CC;
+                font-size: 12px;
+            }
+            QSpinBox {
+                background: #07090D;
+                color: #F1EBDD;
+                border: 1px solid #6F879B;
+                border-radius: 6px;
+                padding: 6px;
+                font-size: 14px;
+            }
+            QPushButton {
+                border: 1px solid #46586B;
+                border-radius: 6px;
+                padding: 8px 12px;
+                background: #07090D;
+                color: #F1EBDD;
+                font-size: 14px;
+            }
+            QPushButton:hover { background: #101724; border-color: #9FB7CC; }
+            QPushButton#primaryButton {
+                background: #20162E;
+                color: #F1EBDD;
+                border-color: #775E90;
+                font-weight: 600;
+            }
+            QPushButton#primaryButton:hover { background: #34224A; border-color: #B7A6D8; }
+        """)
+        self._build_ui()
+        self.refresh_state()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self.is_collapsed:
+            apply_dark_window_chrome(self)
+
+    def _build_ui(self):
+        self.root_layout = QVBoxLayout(self)
+        self.root_layout.setContentsMargins(14, 14, 14, 14)
+        self.root_layout.setSpacing(12)
+
+        self.display_label = QLabel("25:00")
+        self.display_label.setObjectName("timerDisplay")
+        self.display_label.setAlignment(Qt.AlignCenter)
+        self.display_label.mousePressEvent = self._on_display_label_mouse_press
+        self.root_layout.addWidget(self.display_label)
+
+        self.spin_panel = QWidget()
+        spin_layout = QHBoxLayout(self.spin_panel)
+        spin_layout.setContentsMargins(0, 0, 0, 0)
+        spin_layout.setSpacing(8)
+        self.hour_spin = self._make_spin(0, 23, 0)
+        self.minute_spin = self._make_spin(0, 59, 25)
+        self.second_spin = self._make_spin(0, 59, 0)
+        for label, spin in (("小时", self.hour_spin), ("分钟", self.minute_spin), ("秒", self.second_spin)):
+            box = QVBoxLayout()
+            title = QLabel(label)
+            title.setObjectName("fieldLabel")
+            title.setAlignment(Qt.AlignCenter)
+            box.addWidget(title)
+            box.addWidget(spin)
+            spin_layout.addLayout(box)
+        self.root_layout.addWidget(self.spin_panel)
+
+        self.button_panel = QWidget()
+        btn_layout = QHBoxLayout(self.button_panel)
+        btn_layout.setContentsMargins(0, 0, 0, 0)
+        btn_layout.setSpacing(8)
+        self.start_pause_btn = QPushButton("开始")
+        self.start_pause_btn.setObjectName("primaryButton")
+        self.start_pause_btn.clicked.connect(self.on_start_pause)
+        self.reset_btn = QPushButton("重置")
+        self.reset_btn.clicked.connect(self.on_reset)
+        self.collapse_btn = QPushButton("收起")
+        self.collapse_btn.clicked.connect(self.collapse_to_badge)
+        btn_layout.addWidget(self.start_pause_btn)
+        btn_layout.addWidget(self.reset_btn)
+        btn_layout.addWidget(self.collapse_btn)
+        self.root_layout.addWidget(self.button_panel)
+
+    def _make_spin(self, min_value, max_value, value):
+        spin = QSpinBox()
+        spin.setRange(min_value, max_value)
+        spin.setValue(value)
+        spin.setAlignment(Qt.AlignCenter)
+        spin.valueChanged.connect(self.refresh_idle_display)
+        return spin
+
+    def selected_seconds(self):
+        return (
+            self.hour_spin.value() * 3600
+            + self.minute_spin.value() * 60
+            + self.second_spin.value()
+        )
+
+    def set_spin_seconds(self, seconds):
+        seconds = int(max(0, seconds))
+        self.hour_spin.blockSignals(True)
+        self.minute_spin.blockSignals(True)
+        self.second_spin.blockSignals(True)
+        self.hour_spin.setValue(min(23, seconds // 3600))
+        seconds %= 3600
+        self.minute_spin.setValue(seconds // 60)
+        self.second_spin.setValue(seconds % 60)
+        self.hour_spin.blockSignals(False)
+        self.minute_spin.blockSignals(False)
+        self.second_spin.blockSignals(False)
+
+    def refresh_idle_display(self):
+        if self.pet and self.pet.is_focus_timer_active():
+            return
+        self.display_label.setText(self._format_clock(max(1, self.selected_seconds())))
+
+    def refresh_state(self):
+        remaining = self.pet.get_focus_timer_remaining_seconds() if self.pet else 0
+        if self.pet and self.pet.focus_timer_paused:
+            self.display_label.setText(self._format_clock(remaining))
+            self.start_pause_btn.setText("继续")
+            self.reset_btn.setText("重置")
+            return
+        if self.pet and self.pet.focus_timer_end_at:
+            self.display_label.setText(self._format_clock(remaining))
+            self.start_pause_btn.setText("暂停")
+            self.reset_btn.setText("重置")
+            return
+        self.start_pause_btn.setText("开始")
+        self.reset_btn.setText("重置")
+        self.refresh_idle_display()
+
+    def collapse_to_badge(self):
+        if self.is_collapsed:
+            return
+        self._expanded_geometry = self.geometry()
+        self.is_collapsed = True
+        self.spin_panel.hide()
+        self.button_panel.hide()
+        self.root_layout.setContentsMargins(8, 8, 8, 8)
+        self.root_layout.setSpacing(0)
+        self.display_label.setCursor(Qt.PointingHandCursor)
+        self.display_label.setStyleSheet("""
+            QLabel#timerDisplay {
+                background: #07090D;
+                color: #F1EBDD;
+                border: 1px solid #9FB7CC;
+                border-radius: 8px;
+                font-size: 18px;
+                font-weight: 600;
+                padding: 10px;
+            }
+        """)
+        self.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.resize(112, 58)
+        screen = QApplication.primaryScreen()
+        if screen:
+            rect = screen.availableGeometry()
+            self.move(rect.right() - self.width() - 18, rect.top() + 18)
+        self.show()
+        self.refresh_state()
+
+    def expand_from_badge(self):
+        if not self.is_collapsed:
+            return
+        self.is_collapsed = False
+        self.spin_panel.show()
+        self.button_panel.show()
+        self.root_layout.setContentsMargins(14, 14, 14, 14)
+        self.root_layout.setSpacing(12)
+        self.display_label.setCursor(Qt.ArrowCursor)
+        self.display_label.setStyleSheet("")
+        self.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
+        if self._expanded_geometry:
+            self.setGeometry(self._expanded_geometry)
+        else:
+            self.resize(320, 220)
+        self.show()
+        apply_dark_window_chrome(self)
+        self.refresh_state()
+
+    def mousePressEvent(self, event):
+        if self.is_collapsed and event.button() == Qt.LeftButton:
+            self.expand_from_badge()
+            return
+        super().mousePressEvent(event)
+
+    def _on_display_label_mouse_press(self, event):
+        if self.is_collapsed and event.button() == Qt.LeftButton:
+            self.expand_from_badge()
+            event.accept()
+            return
+        QLabel.mousePressEvent(self.display_label, event)
+
+    def on_start_pause(self):
+        if not self.pet:
+            return
+        if self.pet.focus_timer_end_at:
+            self.pet.pause_focus_timer()
+            return
+        if self.pet.focus_timer_paused:
+            self.pet.resume_focus_timer()
+            return
+        seconds = self.selected_seconds()
+        if seconds <= 0:
+            seconds = 25 * 60
+            self.set_spin_seconds(seconds)
+        self.pet.start_focus_timer(seconds, label="专注")
+
+    def on_reset(self):
+        if self.pet:
+            self.pet.cancel_focus_timer(show_message=False)
+        self.set_spin_seconds(25 * 60)
+        self.display_label.setText("25:00")
+        self.start_pause_btn.setText("开始")
+
+    @staticmethod
+    def _format_clock(seconds):
+        seconds = int(max(0, seconds))
+        h = seconds // 3600
+        m = (seconds % 3600) // 60
+        s = seconds % 60
+        if h:
+            return f"{h:02d}:{m:02d}:{s:02d}"
+        return f"{m:02d}:{s:02d}"
+
+
 class DesktopPet(QWidget):
     def __init__(self):
         super().__init__()
         # 初始化数据库及记忆衰减
         init_db()
         daily_decay_memory()
+        refresh_user_profile_from_long_term(force=True)
+        schedule_chroma_sync_repair()
         
         # 每天定时再执行一次遗忘整理 (86400000 毫秒 = 24小时)
         self.decay_timer = QTimer()
@@ -1716,27 +1602,48 @@ class DesktopPet(QWidget):
         
         self.todo_window = None
         self.chat_window = None
+        self.memory_window = None
+        self.focus_timer_window = None
         self.offset = QPoint()
         self.current_frame = 0
         self.is_happy = False
         self.happy_timer = 0
+        self.proactive_care_thread = None
+        self.proactive_auto_enabled = True
+        self.last_user_interaction_at = None
+        self.last_proactive_at = None
+        self.proactive_today = datetime.date.today()
+        self.proactive_count_today = 0
+        self.pending_proactive_messages = []
+        self.focus_timer_end_at = None
+        self.focus_timer_label = "专注"
+        self.focus_timer_total_seconds = 0
+        self.focus_timer_remaining_seconds = 0
+        self.focus_timer_paused = False
+        self.local_care_enabled = True
         
-        # 聊天和提醒相关计时
-        self.chat_timer = QTimer()
-        self.chat_timer.timeout.connect(self.random_chat)
-        self.chat_timer.start(1000 * 60 * 15)  # 15分钟随机闲聊一次
+        # 主动关怀：根据上下文低频发聊天消息，和本地生活提醒分开。
+        self.chat_timer = QTimer(self)
+        self.chat_timer.timeout.connect(self.proactive_companion_tick)
+        self.chat_timer.start(1000 * 60 * 10)  # 10分钟检查一次，实际发言会被冷却限制
+
+        # 本地生活提醒：启动即运行，只弹气泡，不走 LLM，不写聊天历史。
+        self.local_bubble_timer = QTimer(self)
+        self.local_bubble_timer.timeout.connect(self.local_bubble_tick)
+        self.local_bubble_timer.start(1000 * 60 * 30)
         
-        self.sit_timer = QTimer()
+        self.sit_timer = QTimer(self)
         self.sit_timer.timeout.connect(self.remind_stand_up)
-        self.sit_timer.start(1000 * 60 * 60)  # 60分钟提醒一次久坐
+        self.sit_timer.start(1000 * 60 * 45)
         
-        self.water_timer = QTimer()
+        self.water_timer = QTimer(self)
         self.water_timer.timeout.connect(self.remind_drink_water)
-        self.water_timer.start(1000 * 60 * 45)  # 45分钟提醒一次喝水
+        self.water_timer.start(1000 * 60 * 30)
 
         self.init_ui()
         self.init_animation()
         self.check_special_day()
+        self.schedule_startup_local_care()
 
     def init_ui(self):
         self.setWindowFlags(
@@ -1762,12 +1669,12 @@ class DesktopPet(QWidget):
         self.bubble.setWordWrap(True)
         self.bubble.setStyleSheet("""
             QLabel {
-                background-color: rgba(255, 255, 230, 230);
-                border: 2px solid #FFB347;
-                border-radius: 10px;
+                background-color: rgba(5, 6, 7, 238);
+                border: 1px solid #6F879B;
+                border-radius: 8px;
                 padding: 5px 25px 5px 10px;
                 font-size: 12px;
-                color: #333;
+                color: #F1EBDD;
                 font-family: "Microsoft YaHei";
             }
         """)
@@ -1779,13 +1686,13 @@ class DesktopPet(QWidget):
         self.close_bubble_btn.setStyleSheet("""
             QPushButton {
                 background-color: transparent;
-                color: #999;
+                color: #9FB7CC;
                 border: none;
                 font-size: 12px;
                 font-weight: bold;
             }
             QPushButton:hover {
-                color: #FF6B6B;
+                color: #F1EBDD;
             }
         """)
         self.close_bubble_btn.clicked.connect(self.hide_bubble)
@@ -1799,6 +1706,25 @@ class DesktopPet(QWidget):
         self.bubble_hide_timer = QTimer()
         self.bubble_hide_timer.timeout.connect(self.hide_bubble)
         self.bubble_hide_timer.setSingleShot(True)
+
+        self.focus_timer_badge = QLabel(self)
+        self.focus_timer_badge.setAlignment(Qt.AlignCenter)
+        self.focus_timer_badge.setGeometry(96, 4, 78, 28)
+        self.focus_timer_badge.setStyleSheet("""
+            QLabel {
+                background-color: rgba(7, 9, 13, 238);
+                border: 1px solid #6F879B;
+                border-radius: 8px;
+                color: #F1EBDD;
+                font-size: 12px;
+                font-weight: bold;
+                font-family: "Microsoft YaHei";
+            }
+        """)
+        self.focus_timer_badge.hide()
+
+        self.focus_countdown_timer = QTimer(self)
+        self.focus_countdown_timer.timeout.connect(self.update_focus_timer_badge)
 
         screen_obj = QApplication.primaryScreen()
         if screen_obj:
@@ -1939,44 +1865,116 @@ class DesktopPet(QWidget):
                 self.pet_movie.setFileName(skin_path)
                 self.pet_movie.start()
 
-    def random_chat(self):
-        # 只有在没有气泡显示时才闲聊
+    def observe_user_message(self, text):
+        self.last_user_interaction_at = datetime.datetime.now()
+        QTimer.singleShot(1000 * 60 * 12, self.proactive_companion_tick)
+
+    def proactive_companion_tick(self):
+        if not self.proactive_auto_enabled:
+            return
+        now = datetime.datetime.now()
+        if 1 <= now.hour < 7:
+            return
+        if self.proactive_today != now.date():
+            self.proactive_today = now.date()
+            self.proactive_count_today = 0
+        if self.proactive_count_today >= 10:
+            return
+        if self.last_proactive_at and (now - self.last_proactive_at).total_seconds() < 45 * 60:
+            return
+        if self.proactive_care_thread is not None and self.proactive_care_thread.isRunning():
+            return
+        self.proactive_care_thread = ProactiveCareThread()
+        self.proactive_care_thread.finished_signal.connect(self.on_proactive_care_generated)
+        self.proactive_care_thread.error_signal.connect(self.on_proactive_care_error)
+        self.proactive_care_thread.start()
+
+    def on_proactive_care_generated(self, text):
+        text = str(text or "").strip()
+        if not text:
+            return
+        self.send_proactive_message(text, state="llm_context")
+
+    def on_proactive_care_error(self, error):
+        print(f"[Proactive] 主动关怀生成失败: {error}")
+
+    def local_bubble_tick(self):
+        if not self.local_care_enabled:
+            return
         if self.bubble_container.isVisible():
             return
-            
-        now = datetime.datetime.now()
-        hour = now.hour
-        
+        hour = datetime.datetime.now().hour
+        if 1 <= hour < 7:
+            return
         messages = [
-            "今天也要元气满满哦！✨",
-            "有需要帮忙的随时叫我~ ",
-            "发呆中... o(￣▽￣)ｄ",
-            "代码写得怎么样啦？💻",
-            "偶尔看看窗外，让眼睛休息一下吧~ 🌲",
-            "好想吃年糕呀... "
+            "记得喝水。别等到口渴才想起来。",
+            "坐久了就站起来走两步。",
+            "眼睛离屏幕远一点。看久了会累。",
+            "如果在学习，就先做完下一小段。",
+            "肩膀放松。别一直绷着。",
+            "有事要记就直接告诉我，我会写进待办。",
         ]
-        
-        # 根据时间段增加特定对话
-        if 6 <= hour < 9:
-            messages.append("早上好呀！新的一天开始了！🌅")
-            messages.append("吃早饭了吗？一定要吃早饭哦！🍞")
-        elif 11 <= hour <= 13:
-            messages.append("到饭点啦，准备吃什么好吃的？🍱")
-            messages.append("午休时间，小憩一会吧~ 💤")
-        elif 22 <= hour or hour < 2:
-            messages.append("夜深了，该准备睡觉啦！不要熬夜哦~ 🌙")
-            messages.append("还在肝代码吗？注意身体呀！🦉")
-            
-        msg = random.choice(messages)
-        self.show_bubble(msg, duration=5000)
+        self.show_local_care_bubble(random.choice(messages), duration=6000)
+
+    def schedule_startup_local_care(self):
+        QTimer.singleShot(1000 * 20, self.startup_local_care_tick)
+        QTimer.singleShot(1000 * 60 * 30, self.remind_drink_water)
+        QTimer.singleShot(1000 * 60 * 45, self.remind_stand_up)
+        QTimer.singleShot(1000 * 60 * 3, self.proactive_companion_tick)
+
+    def startup_local_care_tick(self):
+        self.show_local_care_bubble("我在。水放近一点，别一直盯着屏幕。", duration=6000)
+
+    def show_local_care_bubble(self, text, duration=6000):
+        if not self.local_care_enabled:
+            return False
+        hour = datetime.datetime.now().hour
+        if 1 <= hour < 7:
+            return False
+        if self.bubble_container.isVisible():
+            QTimer.singleShot(1000 * 25, lambda: self.show_local_care_bubble(text, duration))
+            return False
+        self.set_happy()
+        self.show_bubble(text, duration=duration)
+        return True
+
+    def send_proactive_message(self, text, state="idle"):
+        if not text:
+            return
+        self.last_proactive_at = datetime.datetime.now()
+        self.proactive_count_today += 1
+        try:
+            conversation_history.add_turn("", text)
+        except Exception as e:
+            print(f"[Proactive] 写入对话历史失败: {e}")
+        self.pending_proactive_messages.append({"text": text, "state": state, "time": self.last_proactive_at.isoformat()})
+        if self.chat_window is not None and self.chat_window.isVisible():
+            old_feedback_context = getattr(self.chat_window, "last_user_message_for_feedback", "")
+            self.chat_window.last_user_message_for_feedback = "[主动陪伴消息]"
+            self.chat_window.add_message(text, is_user=False)
+            self.chat_window.last_user_message_for_feedback = old_feedback_context
+            self.pending_proactive_messages.clear()
+        if not self.bubble_container.isVisible():
+            self.show_bubble("有事找你。看看聊天窗口。", duration=6000)
+
+    def flush_pending_proactive_messages(self):
+        if self.chat_window is None or not self.chat_window.isVisible():
+            return
+        for msg in self.pending_proactive_messages:
+            old_feedback_context = getattr(self.chat_window, "last_user_message_for_feedback", "")
+            self.chat_window.last_user_message_for_feedback = "[主动陪伴消息]"
+            self.chat_window.add_message(msg.get("text", ""), is_user=False)
+            self.chat_window.last_user_message_for_feedback = old_feedback_context
+        self.pending_proactive_messages.clear()
+
+    def random_chat(self):
+        self.proactive_companion_tick()
 
     def remind_drink_water(self):
-        self.set_happy()
-        self.show_bubble("叮铃铃~ 喝水时间到！快去喝杯水吧！💧", duration=6000)
+        self.show_local_care_bubble("喝水。现在就去倒一点，别等口渴。", duration=6500)
         
     def remind_stand_up(self):
-        self.set_happy()
-        self.show_bubble("坐了很久啦，站起来活动一下筋骨吧！🏃‍♂️", duration=6000)
+        self.show_local_care_bubble("站起来走两步。肩膀和眼睛都该休息一下。", duration=6500)
 
     def show_bubble(self, text, duration=3000):
         self.typewriter_timer.stop()
@@ -1996,6 +1994,8 @@ class DesktopPet(QWidget):
         self.bubble.setText("")
         
         self.bubble_container.show()
+        if getattr(self, "focus_timer_badge", None) is not None and self.focus_timer_badge.isVisible():
+            self.focus_timer_badge.raise_()
         
         # 存储气泡停留时间
         self.bubble_duration = duration
@@ -2015,6 +2015,110 @@ class DesktopPet(QWidget):
         self.typewriter_timer.stop()
         self.bubble_hide_timer.stop()
         self.bubble_container.hide()
+
+    def is_focus_timer_active(self):
+        return bool(self.focus_timer_end_at or self.focus_timer_paused)
+
+    def get_focus_timer_remaining_seconds(self):
+        if self.focus_timer_paused:
+            return int(max(0, self.focus_timer_remaining_seconds))
+        if self.focus_timer_end_at:
+            return int(max(0, (self.focus_timer_end_at - datetime.datetime.now()).total_seconds() + 0.9))
+        return 0
+
+    def _sync_focus_timer_window(self):
+        if self.focus_timer_window is not None and self.focus_timer_window.isVisible():
+            self.focus_timer_window.refresh_state()
+
+    def _render_focus_timer_badge(self, remaining=None):
+        if remaining is None:
+            remaining = self.get_focus_timer_remaining_seconds()
+        if self.focus_timer_paused:
+            text = f"暂停 {format_focus_duration(remaining)}"
+        else:
+            text = format_focus_duration(remaining)
+        self.focus_timer_badge.setText(text)
+        self.focus_timer_badge.adjustSize()
+        width = max(78, self.focus_timer_badge.width() + 14)
+        self.focus_timer_badge.setGeometry(max(0, 176 - width), 4, width, 28)
+        self.focus_timer_badge.show()
+        self.focus_timer_badge.raise_()
+
+    def start_focus_timer(self, seconds, label="专注"):
+        seconds = int(max(5, min(int(seconds or 0), 24 * 60 * 60)))
+        self.focus_timer_label = (label or "专注").strip()[:8] or "专注"
+        self.focus_timer_total_seconds = seconds
+        self.focus_timer_remaining_seconds = seconds
+        self.focus_timer_paused = False
+        self.focus_timer_end_at = datetime.datetime.now() + datetime.timedelta(seconds=seconds)
+        self._render_focus_timer_badge(seconds)
+        self.focus_countdown_timer.start(1000)
+        self._sync_focus_timer_window()
+        self.show_bubble(f"{self.focus_timer_label}定时开始：{format_focus_duration(seconds)}。", duration=3500)
+
+    def pause_focus_timer(self):
+        if not self.focus_timer_end_at:
+            return False
+        self.focus_timer_remaining_seconds = self.get_focus_timer_remaining_seconds()
+        self.focus_timer_end_at = None
+        self.focus_timer_paused = True
+        self.focus_countdown_timer.stop()
+        self._render_focus_timer_badge(self.focus_timer_remaining_seconds)
+        self._sync_focus_timer_window()
+        self.show_bubble("专注定时已暂停。", duration=2500)
+        return True
+
+    def resume_focus_timer(self):
+        if not self.focus_timer_paused or self.focus_timer_remaining_seconds <= 0:
+            return False
+        self.focus_timer_paused = False
+        self.focus_timer_end_at = datetime.datetime.now() + datetime.timedelta(seconds=self.focus_timer_remaining_seconds)
+        self.focus_countdown_timer.start(1000)
+        self._render_focus_timer_badge(self.focus_timer_remaining_seconds)
+        self._sync_focus_timer_window()
+        self.show_bubble("继续计时。", duration=2500)
+        return True
+
+    def cancel_focus_timer(self, show_message=True):
+        if not self.is_focus_timer_active():
+            if show_message:
+                self.show_bubble("现在没有正在计时的专注定时。", duration=3000)
+            return False
+        self.focus_countdown_timer.stop()
+        self.focus_timer_end_at = None
+        self.focus_timer_paused = False
+        self.focus_timer_remaining_seconds = 0
+        self.focus_timer_total_seconds = 0
+        self.focus_timer_badge.hide()
+        self._sync_focus_timer_window()
+        if show_message:
+            self.show_bubble("专注定时取消了。", duration=3000)
+        return True
+
+    def update_focus_timer_badge(self):
+        if not self.focus_timer_end_at:
+            return
+        remaining = self.get_focus_timer_remaining_seconds()
+        self.focus_timer_remaining_seconds = remaining
+        if remaining <= 0:
+            self.finish_focus_timer()
+            return
+        self._render_focus_timer_badge(remaining)
+        self._sync_focus_timer_window()
+
+    def finish_focus_timer(self):
+        label = self.focus_timer_label or "专注"
+        self.focus_countdown_timer.stop()
+        self.focus_timer_end_at = None
+        self.focus_timer_paused = False
+        self.focus_timer_remaining_seconds = 0
+        self.focus_timer_total_seconds = 0
+        self.focus_timer_badge.hide()
+        self._sync_focus_timer_window()
+        text = f"{label}定时结束了。先停一下，别把自己烧干。"
+        self.show_bubble(text, duration=9000)
+        if self.chat_window is not None and self.chat_window.isVisible():
+            self.chat_window.add_message(f"⏱ {text}", is_user=False)
 
     def set_happy(self):
         self.is_happy = True
@@ -2038,35 +2142,52 @@ class DesktopPet(QWidget):
         menu = QMenu(self)
         menu.setStyleSheet("""
             QMenu {
-                background-color: #FFF8E7;
-                border: 2px solid #FFB347;
+                background-color: #050607;
+                color: #F1EBDD;
+                border: 1px solid #46586B;
                 border-radius: 8px;
-                padding: 5px;
+                padding: 6px;
                 font-size: 13px;
             }
             QMenu::item {
-                padding: 8px 25px;
-                border-radius: 4px;
+                padding: 8px 24px;
+                border-radius: 6px;
+                background: transparent;
             }
             QMenu::item:selected {
-                background-color: #FFE0B2;
+                background-color: #20162E;
+                color: #F1EBDD;
+            }
+            QMenu::separator {
+                height: 1px;
+                background: #273546;
+                margin: 6px 8px;
             }
         """)
 
-        todo_action = menu.addAction("📋 打开待办清单")
-        chat_action = menu.addAction("💬 聊天")
-        kb_action = menu.addAction("📚 添加知识库")
-        pet_action = menu.addAction("🐱 摸摸我")
+        todo_action = menu.addAction("打开待办清单")
+        chat_action = menu.addAction("聊天")
+        focus_timer_action = menu.addAction("专注定时器")
+        cancel_timer_action = menu.addAction("取消专注定时")
+        memory_action = menu.addAction("记忆管理")
+        kb_action = menu.addAction("添加知识库")
+        pet_action = menu.addAction("摸摸我")
         menu.addSeparator()
-        settings_action = menu.addAction("⚙ 设置")
+        settings_action = menu.addAction("设置")
         menu.addSeparator()
-        quit_action = menu.addAction("👋 退出")
+        quit_action = menu.addAction("退出")
 
         action = menu.exec_(event.globalPos())
         if action == todo_action:
             self.open_todo()
         elif action == chat_action:
             self.open_chat()
+        elif action == focus_timer_action:
+            self.open_focus_timer()
+        elif action == cancel_timer_action:
+            self.cancel_focus_timer()
+        elif action == memory_action:
+            self.open_memory_manager()
         elif action == kb_action:
             self.add_to_knowledge_base()
         elif action == pet_action:
@@ -2128,9 +2249,11 @@ class DesktopPet(QWidget):
             self.chat_window.move(x, y)
             
             self.chat_window.show()
+            self.flush_pending_proactive_messages()
             self.show_bubble("来聊天吧！", duration=3000)
         else:
             self.chat_window.activateWindow()
+            self.flush_pending_proactive_messages()
 
     def open_todo(self):
         if self.todo_window is None or not self.todo_window.isVisible():
@@ -2142,278 +2265,35 @@ class DesktopPet(QWidget):
         else:
             self.todo_window.activateWindow()
 
-
-# ==================== GPT-SoVITS 语音合成接入 ====================
-# 思路：
-#   1) GPT-SoVITS 自带的 FastAPI 服务 (api_v2.py) 在 http://127.0.0.1:9880 提供 /tts 端点。
-#      使用前需要先在另一个终端用工程自带的 runtime 启动一次：
-#          cd voice\GPT-SoVITS-v2pro-20250604
-#          runtime\python.exe api_v2.py -a 127.0.0.1 -p 9880 -c GPT_SoVITS\configs\tts_infer.yaml
-#      首次启动会加载 BERT + HuBERT + GPT/SoVITS 三套模型，大约 10-30s。
-#   2) 每条桌宠回复在后台线程里合成一份 wav，落到本地 ./tts_cache/tts_<msg_id>.wav。
-#      气泡最右边的 🔊 按钮按下即可（重）播放；合成中显示 ⏳，失败显示 ⚠️（点一下重试）。
-#   3) 旧消息被从聊天里删掉时，对应 wav 一起删；退出桌宠时再把整个 tts_cache 和
-#      GPT-SoVITS/TEMP/gradio（用户提到 gradio 不会自清）扫一遍。
-import shutil
-
-TTS_GPT_SOVITS_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "voice", "GPT-SoVITS-v2pro-20250604",
-)
-TTS_GRADIO_TEMP_DIR = os.path.join(TTS_GPT_SOVITS_DIR, "TEMP", "gradio")
-
-TTS_CACHE_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "tts_cache",
-)
-try:
-    os.makedirs(TTS_CACHE_DIR, exist_ok=True)
-except Exception as _e:
-    print(f"[TTS] 建立 tts_cache 目录失败: {_e}")
-
-# 优先级：环境变量 > AppConfig > 默认值
-TTS_API_BASE = (
-    os.environ.get("PET_TTS_API")
-    or app_config.get("tts.api_base")
-    or "http://127.0.0.1:9880"
-)
-
-# 参考音频 + 标注文本。默认指向训练时切出来的一段（output/slicer_opt）。
-# 用户可在 SettingsWindow 里指定自己的参考音频，没填的话仍走下面这个默认路径。
-TTS_REF_AUDIO = app_config.get("tts.ref_audio") or os.path.join(
-    TTS_GPT_SOVITS_DIR,
-    "output", "slicer_opt", "A40_1_5_0008.mp3",
-)
-TTS_REF_TEXT  = app_config.get("tts.ref_text") or "あなたが人を批評するのは珍しいわね。そういうダメな人。気にするたちだったの。。"
-TTS_REF_LANG  = app_config.get("tts.ref_lang") or "ja"
-TTS_TEXT_LANG = app_config.get("tts.text_lang") or "zh"
-
-# 微调后的有珠音色权重（相对 GPT-SoVITS 工程根）。脚本启动时会异步调一次 set_xxx_weights，
-# 没切上去也不会卡死，会用 api_v2.py 启动时已经加载的默认权重。
-TTS_GPT_WEIGHTS    = app_config.get("tts.gpt_weights")    or "GPT_weights_v2Pro/有珠语音-e15.ckpt"
-TTS_SOVITS_WEIGHTS = app_config.get("tts.sovits_weights") or "SoVITS_weights_v2Pro/有珠语音_e8_s392.pth"
-
-TTS_REQUEST_TIMEOUT = 150        # 单次 /tts 请求超时（推理通常 3-15s，留宽点）
-TTS_MAX_TEXT_LEN = 300           # 过长的句子直接截断，免得合成动辄半分钟
-
-
-def _tts_clean_text(text):
-    """剥掉 markdown 图片 / 末尾 emotion 标签 / URL 等不该读出来的东西。"""
-    if not text:
-        return ""
-    s = re.sub(r"!\[.*?\]\(.*?\)", "", text)
-    s = s.strip()
-    s = re.sub(r"\[[^\[\]]{0,15}\]$", "", s).strip()
-    s = re.sub(r"\([^\(\)]{0,15}\)$", "", s).strip()
-    s = re.sub(r"https?://\S+", "", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s[:TTS_MAX_TEXT_LEN]
-
-
-def _tts_cache_path_for_id(msg_id):
-    return os.path.join(TTS_CACHE_DIR, f"tts_{msg_id}.wav")
-
-
-class TTSClient:
-    """对 GPT-SoVITS api_v2.py 的最小封装；线程安全（共用一个 requests.Session）。"""
-
-    def __init__(self):
-        self._session = requests.Session()
-        self._weights_set = False
-        self._lock = threading.Lock()
-
-    def _ensure_weights(self):
-        with self._lock:
-            if self._weights_set:
-                return
-            try:
-                self._session.get(
-                    f"{TTS_API_BASE}/set_gpt_weights",
-                    params={"weights_path": TTS_GPT_WEIGHTS},
-                    timeout=30,
-                )
-                self._session.get(
-                    f"{TTS_API_BASE}/set_sovits_weights",
-                    params={"weights_path": TTS_SOVITS_WEIGHTS},
-                    timeout=30,
-                )
-                print(f"[TTS] 已切换到有珠微调权重 ({TTS_GPT_WEIGHTS})")
-            except Exception as e:
-                print(f"[TTS] 切换权重失败，沿用 api_v2 默认权重：{e}")
-            self._weights_set = True
-
-    def synthesize_to_file(self, text, out_path):
-        """合成一段语音并写入 out_path。返回 True/False。"""
-        clean = _tts_clean_text(text)
-        if not clean:
-            return False
-        # 如果已经有缓存（同一个 msg_id 重复触发），直接当成功用
-        if os.path.exists(out_path) and os.path.getsize(out_path) > 200:
-            return True
-
-        self._ensure_weights()
-
-        payload = {
-            "text": clean,
-            "text_lang": TTS_TEXT_LANG,
-            "ref_audio_path": TTS_REF_AUDIO,
-            "prompt_text": TTS_REF_TEXT,
-            "prompt_lang": TTS_REF_LANG,
-            "text_split_method": "cut5",
-            "media_type": "wav",
-            "streaming_mode": False,
-            "batch_size": 1,
-            "speed_factor": 1.0,
-        }
-        try:
-            resp = self._session.post(
-                f"{TTS_API_BASE}/tts",
-                json=payload,
-                timeout=TTS_REQUEST_TIMEOUT,
-            )
-        except Exception as e:
-            print(f"[TTS] /tts 请求失败：{e}")
-            return False
-        if resp.status_code != 200:
-            print(f"[TTS] /tts 返回 {resp.status_code}：{resp.text[:200]}")
-            return False
-        tmp_path = out_path + ".part"
-        try:
-            with open(tmp_path, "wb") as f:
-                f.write(resp.content)
-            os.replace(tmp_path, out_path)
-            return True
-        except Exception as e:
-            print(f"[TTS] 写缓存 {out_path} 失败：{e}")
-            try:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-            except OSError:
-                pass
-            return False
-
-
-tts_client = TTSClient()
-
-
-class TTSSynthThread(QThread):
-    """单条回复的后台合成线程。完成后 emit (msg_id, wav_path or '')."""
-    finished_signal = pyqtSignal(str, str)
-
-    def __init__(self, msg_id, text, parent=None):
-        super().__init__(parent)
-        self.msg_id = msg_id
-        self.text = text
-        self.out_path = _tts_cache_path_for_id(msg_id)
-
-    def run(self):
-        ok = False
-        try:
-            ok = tts_client.synthesize_to_file(self.text, self.out_path)
-        except Exception as e:
-            print(f"[TTS] 合成线程异常：{e}")
-        self.finished_signal.emit(self.msg_id, self.out_path if ok else "")
-
-
-# ---- 本地缓存清理 ----
-def _purge_dir_contents(dir_path):
-    """删除 dir_path 下所有文件/子目录，不删 dir_path 本身。"""
-    if not dir_path or not os.path.isdir(dir_path):
-        return 0
-    n = 0
-    for name in os.listdir(dir_path):
-        p = os.path.join(dir_path, name)
-        try:
-            if os.path.isdir(p) and not os.path.islink(p):
-                shutil.rmtree(p, ignore_errors=True)
+    def open_focus_timer(self):
+        if self.focus_timer_window is None or not self.focus_timer_window.isVisible():
+            self.focus_timer_window = FocusTimerWindow(self)
+            screen = QApplication.primaryScreen()
+            if screen:
+                rect = screen.availableGeometry()
+                self.focus_timer_window.move(rect.right() - 320 - 18, rect.top() + 18)
             else:
-                os.remove(p)
-            n += 1
-        except Exception:
-            pass
-    return n
+                pos = self.mapToGlobal(QPoint(-150, -40))
+                self.focus_timer_window.move(pos)
+            self.focus_timer_window.show()
+        else:
+            if getattr(self.focus_timer_window, "is_collapsed", False):
+                self.focus_timer_window.expand_from_badge()
+            self.focus_timer_window.refresh_state()
+            self.focus_timer_window.activateWindow()
 
-
-def cleanup_tts_artifacts(purge_local_cache=False):
-    """启动 / 退出时调一次：
-       - 永远清 GPT-SoVITS/TEMP/gradio（gradio WebUI 试听不会自清，会一直堆 wav）；
-       - 是否一并清本地 tts_cache 由调用方决定（退出时 True，启动时 False）。
-    """
-    try:
-        removed = _purge_dir_contents(TTS_GRADIO_TEMP_DIR)
-        if removed:
-            print(f"[TTS] 已清理 gradio 临时音频 {removed} 项")
-    except Exception as e:
-        print(f"[TTS] 清理 gradio temp 失败：{e}")
-    if purge_local_cache:
-        try:
-            removed = _purge_dir_contents(TTS_CACHE_DIR)
-            if removed:
-                print(f"[TTS] 已清理本地 tts_cache {removed} 项")
-        except Exception as e:
-            print(f"[TTS] 清理 tts_cache 失败：{e}")
-
-
-atexit.register(lambda: cleanup_tts_artifacts(purge_local_cache=True))
-
-
-# ---- 播放器（懒加载 QMediaPlayer，winsound 兜底） ----
-_tts_player_instance = None
-
-
-def _get_tts_player():
-    """QtMultimedia 在 PyQt5 上不一定能跑起来（缺 codec / 插件等），
-    所以失败时返回 None，调用方会回退到 winsound（Windows-only，能播 PCM wav）。"""
-    global _tts_player_instance
-    if _tts_player_instance is not None:
-        return _tts_player_instance
-    try:
-        from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
-        from PyQt5.QtCore import QUrl as _QUrl
-        player = QMediaPlayer()
-        # 把工厂方法挂到 player 上，调用方拿得到 QMediaContent
-        player._make_content = lambda path: QMediaContent(_QUrl.fromLocalFile(path))
-        _tts_player_instance = player
-        return player
-    except Exception as e:
-        print(f"[TTS] QMediaPlayer 不可用，回退到 winsound：{e}")
-        return None
-
-
-def play_tts_file(path):
-    """异步播放本地 wav。优先 QMediaPlayer，失败时退化到 winsound。"""
-    if not path or not os.path.exists(path):
-        return False
-    player = _get_tts_player()
-    if player is not None:
-        try:
-            player.stop()
-            player.setMedia(player._make_content(path))
-            player.play()
-            return True
-        except Exception as e:
-            print(f"[TTS] QMediaPlayer 播放失败，尝试 winsound：{e}")
-    try:
-        import winsound
-        winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
-        return True
-    except Exception as e:
-        print(f"[TTS] winsound 播放也失败：{e}")
-    return False
-
-
-def stop_tts_playback():
-    player = _tts_player_instance
-    if player is not None:
-        try:
-            player.stop()
-        except Exception:
-            pass
-    try:
-        import winsound
-        winsound.PlaySound(None, winsound.SND_PURGE)
-    except Exception:
-        pass
+    def open_memory_manager(self):
+        if self.memory_window is None or not self.memory_window.isVisible():
+            self.memory_window = MemoryManagerWindow(self)
+            screen = QDesktopWidget().screenGeometry()
+            size = self.memory_window.geometry()
+            x = (screen.width() - size.width()) // 2
+            y = (screen.height() - size.height()) // 2
+            self.memory_window.move(x, y)
+            self.memory_window.show()
+        else:
+            self.memory_window.refresh()
+            self.memory_window.activateWindow()
 
 
 # ==================== 远程图片下载线程 ====================
@@ -2438,31 +2318,7 @@ class ImageDownloader(QThread):
             self.finished_signal.emit(QPixmap(), self.label)
 
 # 默认的表情包类别描述，用于大模型判断情感
-DEFAULT_CATEGORY_DESCRIPTIONS = {
-    "angry": "当对话包含抱怨、批评或激烈反对时使用（如用户投诉/观点反驳）",
-    "happy": "用于成功确认、积极反馈或庆祝场景（问题解决/获得成就）",
-    "sad": "表达伤心, 歉意、遗憾或安慰场景（遇到挫折/传达坏消息）",
-    "surprised": "响应超出预期的信息（重大发现/意外转折）注意：轻微惊讶慎用",
-    "confused": "请求澄清或表达理解障碍时（概念模糊/逻辑矛盾）或对于用户的请求感到困惑",
-    "color": "社交场景中的暧昧表达（调情）使用频率≤1次/对话",
-    "cpu": "技术讨论中表示思维卡顿（复杂问题/需要加载时间）",
-    "fool": "自嘲或缓和气氛的幽默场景（小失误/无伤大雅的玩笑）",
-    "givemoney": "涉及报酬讨论时使用（服务付费/奖励机制）需配合明确金额",
-    "like": "表达对事物或观点的喜爱（美食/艺术/优秀方案）",
-    "see": "表示偷瞄或持续关注（监控进度/观察变化）常与时间词搭配",
-    "shy": "涉及隐私话题或收到赞美时（个人故事/外貌评价）",
-    "work": "工作流程相关场景（任务分配/进度汇报）",
-    "reply": "等待用户反馈时（提问后/需要确认）最长间隔30分钟",
-    "meow": "卖萌或萌系互动场景（宠物话题/安抚情绪）慎用于正式场合",
-    "baka": "轻微责备或吐槽（低级错误/可爱型抱怨）禁用程度：友善级",
-    "morning": "早安问候专用（UTC时间6:00-10:00）跨时区需换算",
-    "sleep": "涉及作息场景（熬夜/疲劳/休息建议）",
-    "sigh": "表达无奈, 无语或感慨（重复问题/历史遗留难题）",
-    "none": "当以上情感都不符合，或仅为普通陈述时使用",
-    "dislike": "表达对事物或观点的不喜欢（美食/艺术/优秀方案）",
-    "proud": "表达自豪或满足（如获得奖励/完成任务）",
-    
-}
+
 
 class COSSyncThread(QThread):
     finished_signal = pyqtSignal(bool, str)
@@ -2474,6 +2330,81 @@ class COSSyncThread(QThread):
     def run(self):
         success, msg = cos_manager.sync_local_memes(self.local_dir)
         self.finished_signal.emit(success, msg)
+
+
+class ProactiveCareThread(QThread):
+    finished_signal = pyqtSignal(str)
+    error_signal = pyqtSignal(str)
+
+    def run(self):
+        try:
+            api_key = app_config.get("ark.api_key", "") or ""
+            if not api_key:
+                self.error_signal.emit("ark.api_key 未配置")
+                return
+            base_url = app_config.get("ark.base_url", "") or "https://ark.cn-beijing.volces.com/api/v3"
+            model = app_config.get("ark.model_tool", "") or app_config.get("ark.model_extractor", "") or "doubao-seed-2-0-mini-260428"
+            now = datetime.datetime.now()
+            try:
+                history_turns = conversation_history.get_turns()
+            except Exception:
+                history_turns = []
+            context_text, freshness_rule = format_proactive_context_for_prompt(
+                history_turns,
+                now=now,
+                max_turns=8,
+            )
+            try:
+                profile_context = get_user_profile_prompt_context()
+            except Exception:
+                profile_context = "无"
+            profile_context = str(profile_context or "无")[:900]
+
+            prompt = f"""现在时间是{now.year}年{now.month}月{now.day}日{now.hour}时{now.minute}分。
+
+{ALICE_PROACTIVE_PERSONA}
+
+你的任务：根据带时间的最近上下文，生成一句现在发给用户的低频主动关心。
+
+时效性规则：
+{freshness_rule}
+
+现实边界：
+1. 不能说你正在看见用户、监督用户、守在旁边、触碰用户、递东西、泡饮料或做饭。
+2. 可以提醒喝水、站起来、休息眼睛、问进度、问“在干嘛”。
+3. 不要把昨天或几小时前的事情当成正在发生。
+4. 如果用户之前说在学习/写代码/复习，且时间仍新鲜，可以问“学得怎么样/代码写得怎么样”；如果太久了，就泛泛问现在在做什么。
+
+语气要求：必须像久远寺有珠本人在聊天。简短、克制、略带冷淡关心，可以轻微责备；不要热情客服腔。15到45个汉字，不要表情标签，不要解释。
+
+用户画像摘要：
+{profile_context}
+
+最近上下文：
+{context_text}
+
+只输出 JSON：
+{{"message":"一句主动关心"}}
+"""
+            client = OpenAI(api_key=api_key, base_url=base_url, timeout=10.0, max_retries=0)
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": "你只输出严格 JSON。"},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.7,
+                max_tokens=160,
+                extra_body={"thinking": {"type": "disabled"}},
+            )
+            raw = (response.choices[0].message.content or "").strip()
+            message = clean_proactive_message(raw)
+            if not message:
+                message = "在干嘛？别把自己晾得太久。"
+            self.finished_signal.emit(message)
+        except Exception as e:
+            self.error_signal.emit(str(e))
+
 
 # ==================== LLM 请求线程 ====================
 class LLMFetcherThread(QThread):
@@ -2569,7 +2500,7 @@ class LLMFetcherThread(QThread):
                        不重复写，只给老记忆加一次 access_count + importance_score。
                     2) MySQL 字面完全相同：兜底（向量服务异常时仍能拦住"一字不差"的重复）。
                     """
-                    # `_chrom_distance_to_sim(d) = 1/(1+d)`：
+                    # `chrom_distance_to_sim(d) = 1/(1+d)`：
                     #   - 完全相同   → d≈0     → sim=1.0
                     #   - 同义/近义  → d≲0.25 → sim≳0.80
                     #   - 主题相关  → d≈0.5  → sim≈0.67
@@ -2594,7 +2525,7 @@ class LLMFetcherThread(QThread):
                             dists = (similar.get("distances") or [[]])[0]
                             if docs and dists:
                                 top_doc = docs[0] or ""
-                                top_sim = _chrom_distance_to_sim(dists[0])
+                                top_sim = chrom_distance_to_sim(dists[0])
                                 if top_sim >= MEMORY_DEDUP_SIM_THRESHOLD:
                                     if metas and isinstance(metas[0], dict):
                                         try:
@@ -2622,12 +2553,23 @@ class LLMFetcherThread(QThread):
                                                     c2.execute(
                                                         "UPDATE user_memory SET "
                                                         "  access_count = access_count + 1, "
-                                                        "  importance_score = LEAST(importance_score + 3, %s), "
+                                                        "  importance_score = LEAST(importance_score + %s, %s), "
                                                         "  last_accessed_at = NOW() "
                                                         "WHERE id = %s",
-                                                        (MEM_IMP_CAP, existing_id),
+                                                        (MEM_REPEATED_BUMP, MEM_IMP_CAP, existing_id),
+                                                    )
+                                                    c2.execute(
+                                                        "SELECT importance_score FROM user_memory WHERE id = %s",
+                                                        (existing_id,),
+                                                    )
+                                                    score_row = c2.fetchone()
+                                                    should_promote_existing = (
+                                                        score_row
+                                                        and float(score_row[0] or 0.0) >= MEM_PROMOTE_TO_LONG_TERM_SCORE
                                                     )
                                                 conn_bump.commit()
+                                                if should_promote_existing:
+                                                    promote_memory_to_long_term(existing_id, reason="repeated_by_user")
                                             finally:
                                                 conn_bump.close()
                                         except Exception as bump_e:
@@ -2650,21 +2592,17 @@ class LLMFetcherThread(QThread):
                                 if row:
                                     print(f"[Pet][写记忆] MySQL 已有该 fact（id={row[0]}），跳过。")
                                     return row[0]
+                                initial_score = _initial_importance_for_memory(fact)
                                 cursor.execute(
-                                    "INSERT INTO user_memory (content, keywords) VALUES (%s, %s)",
-                                    (fact, ",".join(kws)),
+                                    "INSERT INTO user_memory (content, keywords, importance_score) VALUES (%s, %s, %s)",
+                                    (fact, ",".join(kws), initial_score),
                                 )
                                 saved_id = cursor.lastrowid
                             conn.commit()
                         finally:
                             conn.close()
                         if saved_id:
-                            chroma_add_documents_sync(
-                                CHROMA_COLLECTION_MEM,
-                                [fact],
-                                [f"mem_{saved_id}"],
-                                metadatas=[{"mysql_id": int(saved_id), "importance_score": 10.0}],
-                            )
+                            sync_short_memory_to_chroma(saved_id, fact, initial_score)
                             print(f"[Pet][写记忆] 已写入 MySQL+Chroma id=mem_{saved_id}")
                     except Exception as bg_e:
                         print(f"[Pet][写记忆] 失败：{bg_e}")
@@ -2694,6 +2632,17 @@ class LLMFetcherThread(QThread):
             categories_str = "\n".join([f"- {k}: {v}" for k, v in DEFAULT_CATEGORY_DESCRIPTIONS.items()])
             # 把本地保存的最近 N 轮对话（不含本轮）一并打包进 prompt，给模型短期上下文
             recent_context_str = conversation_history.format_for_prompt()
+            has_attachment = bool(self.image_path and os.path.exists(self.image_path))
+            current_response_card_str = build_current_response_card(
+                self.user_text,
+                has_attachment=has_attachment,
+                local_prediction=None,
+            )
+            try:
+                user_profile_context_str = get_user_profile_prompt_context()
+            except Exception as profile_e:
+                print("[Pet][prompt] 用户画像上下文读取失败:", profile_e)
+                user_profile_context_str = "无"
 
             system_prompt = f"""你是久远寺有珠（Kuonji Alice），型月世界观《魔法使之夜》中的魔女。
 【核心设定】：你性格孤高、冷淡、守旧、沉默寡言。你说话简短，通常带有距离感，但在熟悉之后会展露出一丝傲娇和隐晦的关心。你遵守魔女的传统，不苟言笑。隐藏于现代的魔女，最后的鸟。自小生活在魔术世界的少女。因某种原因离开故乡英国，并定居于日本的地方城市。
@@ -2712,15 +2661,32 @@ class LLMFetcherThread(QThread):
 相反，她一直守护着母亲在世时的回忆。有珠之所以性格封闭，也是因为她不希望珍贵的回忆被任何人玷污。
 虽然本人想努力成为正确的魔女，但本质如前所述，她仍具备普通少女的一面。
 不要打破角色设定。
-【近期对话】：以下是你和该用户最近的对话历史（最早在前，最新在后；如果为"无"表示没有历史）：
-{recent_context_str}
-【长期记忆】：以下是你脑海中关于该用户的长期记忆（如果有）：
+
+【2. 你能做什么】
+{ALICE_RUNTIME_CAPABILITIES}
+
+【3. 回复方式】
+{ALICE_RESPONSE_STYLE}
+
+【4. 现在面临什么问题，以及当前应对判断】
+{current_response_card_str}
+
+【5. 工具、记忆与知识】
+【用户画像】：以下是根据长期记忆聚合出的结构化用户画像，格式接近 JSON。长期记忆原文不会直接提供给你，请只依据画像理解用户；画像是稳定倾向，不是刚发生的事实：
+{user_profile_context_str}
+【本轮相关短期记忆】：以下是可衰减的工作记忆，只用于辅助当前回复：
 {memory_context_str}
 【外部知识库】：以下是你脑海中的扩展知识（如果有）：
 {knowledge_context_str}
 【表情包触发机制】：以下是你可以使用的表情包情感分类和对应触发场景：
 {categories_str}
-请结合上述近期对话、长期记忆和知识，以久远寺有珠的口吻回复用户，（同时严格记住核心设定，这很重要，不要太多文邹邹的修饰语，同时时刻记住不要描写，这样会降低代入感）；如果用户提到"刚才/上一句/前面说的"等，请优先参考【近期对话】。
+
+【6. 之前干了什么】
+以下是你和该用户最近的对话轮次（最早在前，最新在后；如果为"无"表示没有历史）。这里只用于理解用户刚才在说什么，不用于模仿历史中有珠的具体措辞；括号里的相对时间很重要，只有“刚刚/几分钟前”的内容才可当成当前连续上下文，“昨天/几天前/较早”的内容只能当背景，不能当成刚发生。当前回复必须优先服从角色设定、能力注册表和当前决策卡：
+{recent_context_str}
+
+【最终执行要求】
+请按信息优先级生成回复：先守住角色与能力边界，再回应本轮问题，然后参考当前应对判断，最后才使用画像、短期记忆、知识库和近期上下文。角色语气可以冷淡、克制、略带关心；行动表达必须受“当前桌宠能力”约束。不要太多文绉绉的修饰语，不要写舞台描写，这样会降低代入感；如果用户提到"刚才/上一句/前面说的"等，请优先参考【之前干了什么】。
 重要：请在你的回复最后，单独另起一行，用方括号标出你这句话匹配的情感分类名称（例如：[baka] 或 [happy]，只能是上面列表中的英文单词之一，如果没有适合的请填写[none]）。"""
 
             # 主回复 max_tokens 封顶 1024：原本 SoulState 给到 4000，会鼓励模型一直生成。
@@ -2836,11 +2802,29 @@ class LLMFetcherThread(QThread):
                 persist_executor.shutdown(wait=False)
 
 # ==================== 聊天窗口 ====================
+class ChatInputTextEdit(QTextEdit):
+    send_requested = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptRichText(False)
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter) and not (
+            event.modifiers() & Qt.ShiftModifier
+        ):
+            self.send_requested.emit()
+            return
+        super().keyPressEvent(event)
+
+
 class ChatWindow(QWidget):
     def __init__(self, pet=None):
         super().__init__()
         self.pet = pet
         self.pending_image_path = None
+        self.last_user_message_for_feedback = ""
+        self.feedback_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "feedback_data.jsonl")
         self.setAcceptDrops(True)
         self.init_ui()
 
@@ -2865,13 +2849,17 @@ class ChatWindow(QWidget):
             self.img_preview_label.setText("")
         else:
             self.img_preview_label.clear()
-            self.img_preview_label.setText("📄")
-            self.img_preview_label.setStyleSheet("background-color: #E0E0E0; border-radius: 4px; font-size: 24px;")
+            self.img_preview_label.setText("文件")
+            self.img_preview_label.setStyleSheet(
+                "background-color: #07090D; border: 1px solid #46586B; "
+                "border-radius: 6px; font-size: 12px; color: #C6D4E2;"
+            )
             
         self.img_preview_container.show()
 
     def init_ui(self):
-        self.setWindowTitle("💬 与有珠聊天")
+        self.setWindowTitle("与有珠聊天")
+        apply_dark_window_chrome(self)
         
         # 隐藏左上角默认的程序图标（使用 1x1 像素的透明图标替代）
         transparent_pixmap = QPixmap(1, 1)
@@ -2879,7 +2867,7 @@ class ChatWindow(QWidget):
         self.setWindowIcon(QIcon(transparent_pixmap))
         
         self.resize(400, 600)
-        self.setStyleSheet("background-color: #F5F5F5;")
+        self.setStyleSheet("background-color: #050607; color: #F1EBDD;")
         
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -2888,7 +2876,7 @@ class ChatWindow(QWidget):
         # 聊天记录区域
         self.scroll_area = QScrollArea(self)
         self.scroll_area.setWidgetResizable(True)
-        self.scroll_area.setStyleSheet("border: none; background: #F5F5F5;")
+        self.scroll_area.setStyleSheet("border: none; background: #050607;")
         self.scroll_area.verticalScrollBar().setStyleSheet("""
             QScrollBar:vertical {
                 border: none;
@@ -2897,7 +2885,7 @@ class ChatWindow(QWidget):
                 margin: 0px 0px 0px 0px;
             }
             QScrollBar::handle:vertical {
-                background: #CCCCCC;
+                background: #46586B;
                 min-height: 20px;
                 border-radius: 4px;
             }
@@ -2919,7 +2907,7 @@ class ChatWindow(QWidget):
         
         # 底部输入区域
         input_area = QWidget()
-        input_area.setStyleSheet("background-color: #F5F5F5; border-top: 1px solid #E5E5E5;")
+        input_area.setStyleSheet("background-color: #050607; border-top: 1px solid #273546;")
         input_area_layout = QVBoxLayout(input_area)
         input_area_layout.setContentsMargins(15, 10, 15, 15)
         input_area_layout.setSpacing(5)
@@ -2932,14 +2920,23 @@ class ChatWindow(QWidget):
         
         self.img_preview_label = QLabel()
         self.img_preview_label.setFixedSize(60, 60)
-        self.img_preview_label.setStyleSheet("background-color: #E0E0E0; border-radius: 4px;")
+        self.img_preview_label.setStyleSheet(
+            "background-color: #07090D; border: 1px solid #46586B; "
+            "border-radius: 6px; color: #C6D4E2;"
+        )
         self.img_preview_label.setAlignment(Qt.AlignCenter)
         
         self.clear_img_btn = QPushButton("✕")
         self.clear_img_btn.setFixedSize(20, 20)
         self.clear_img_btn.setStyleSheet("""
-            QPushButton { background-color: #FF6B6B; color: white; border-radius: 10px; font-weight: bold; }
-            QPushButton:hover { background-color: #FF4C4C; }
+            QPushButton {
+                background-color: #20162E;
+                color: #F1EBDD;
+                border: 1px solid #775E90;
+                border-radius: 10px;
+                font-weight: bold;
+            }
+            QPushButton:hover { background-color: #34224A; }
         """)
         self.clear_img_btn.clicked.connect(self.clear_pending_image)
         
@@ -2949,9 +2946,22 @@ class ChatWindow(QWidget):
         
         input_area_layout.addWidget(self.img_preview_container)
         
-        # 文本输入和发送按钮
-        input_layout = QHBoxLayout()
-        input_layout.setContentsMargins(0, 0, 0, 0)
+        # 文本输入和发送按钮：统一放进一个更大的输入栏容器
+        input_shell = QWidget()
+        input_shell.setObjectName("chatInputShell")
+        input_shell.setStyleSheet("""
+            QWidget#chatInputShell {
+                background-color: #07090D;
+                border: 1px solid #46586B;
+                border-radius: 9px;
+            }
+        """)
+        input_shell.setMinimumHeight(54)
+        input_shell.setMaximumHeight(118)
+
+        input_layout = QHBoxLayout(input_shell)
+        input_layout.setContentsMargins(8, 5, 8, 5)
+        input_layout.setSpacing(6)
         
         self.sticker_btn = QPushButton("😊")
         self.sticker_btn.setFixedSize(36, 36)
@@ -2960,8 +2970,9 @@ class ChatWindow(QWidget):
                 background-color: transparent;
                 border: none;
                 font-size: 20px;
+                color: #C6D4E2;
             }
-            QPushButton:hover { background-color: #EAEAEA; border-radius: 6px; }
+            QPushButton:hover { background-color: #101724; border-radius: 6px; }
         """)
         self.sticker_btn.clicked.connect(self.choose_sticker)
         
@@ -2973,55 +2984,78 @@ class ChatWindow(QWidget):
                 background-color: transparent;
                 border: none;
                 font-size: 18px;
+                color: #C6D4E2;
             }
-            QPushButton:hover { background-color: #EAEAEA; border-radius: 6px; }
+            QPushButton:hover { background-color: #101724; border-radius: 6px; }
         """)
         self.sync_btn.clicked.connect(self.sync_memes_to_cos)
         
-        self.input_field = QLineEdit()
-        self.input_field.setPlaceholderText(" ")
+        self.input_field = ChatInputTextEdit()
+        self.input_field.setPlaceholderText("输入消息")
+        self.input_field.setToolTip("Enter 发送，Shift+Enter 换行")
+        self.input_field.setMinimumHeight(40)
+        self.input_field.setMaximumHeight(96)
+        self.input_field.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.input_field.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.input_field.send_requested.connect(self.send_message)
         self.input_field.setStyleSheet("""
-            QLineEdit {
-                background-color: white;
+            QTextEdit {
+                background-color: transparent;
                 border: none;
-                border-radius: 6px;
-                padding: 10px;
+                padding: 4px 6px;
                 font-size: 14px;
                 font-family: "Microsoft YaHei";
+                color: #F1EBDD;
+                selection-background-color: #34224A;
+            }
+            QScrollBar:vertical {
+                width: 8px;
+                background: transparent;
+            }
+            QScrollBar::handle:vertical {
+                background: #46586B;
+                border-radius: 4px;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
             }
         """)
-        self.input_field.returnPressed.connect(self.send_message)
         
         self.send_btn = QPushButton("发送")
-        self.send_btn.setFixedSize(65, 36)
+        self.send_btn.setFixedSize(58, 38)
         self.send_btn.setStyleSheet("""
             QPushButton {
-                background-color: #07C160;
-                color: white;
-                border: none;
+                background-color: #20162E;
+                color: #F1EBDD;
+                border: 1px solid #775E90;
                 border-radius: 6px;
                 font-size: 14px;
-                font-weight: bold;
+                font-weight: 500;
             }
             QPushButton:hover {
-                background-color: #06AD56;
+                background-color: #34224A;
+                border-color: #B7A6D8;
             }
             QPushButton:pressed {
-                background-color: #059A4C;
+                background-color: #1B1328;
             }
         """)
         self.send_btn.clicked.connect(self.send_message)
         
         input_layout.addWidget(self.sticker_btn)
         input_layout.addWidget(self.sync_btn)
-        input_layout.addWidget(self.input_field)
+        input_layout.addWidget(self.input_field, 1)
         input_layout.addWidget(self.send_btn)
         
-        input_area_layout.addLayout(input_layout)
+        input_area_layout.addWidget(input_shell)
         layout.addWidget(input_area)
         
         # 初始问候语
         QTimer.singleShot(200, lambda: self.add_message("没什么事请不要找我。", is_user=False))
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        apply_dark_window_chrome(self)
 
     def clear_pending_image(self):
         self.pending_image_path = None
@@ -3062,20 +3096,38 @@ class ChatWindow(QWidget):
             self.add_message(f"❌ 同步失败: {msg}", is_user=False)
 
     def send_message(self):
-        text = self.input_field.text().strip()
+        text = self.input_field.toPlainText().strip()
         img_path = self.pending_image_path
         
         if not text and not img_path:
             return
-            
+
+        self.last_user_message_for_feedback = text or ("[用户发送了图片/文件]" if img_path else "")
+             
         # 添加用户消息
         self.add_message(text, is_user=True, image_path=img_path)
         self.input_field.clear()
         self.clear_pending_image()
         
         # 如果绑定了桌宠，让它做出回应
+        timer_request = None
         if self.pet:
             self.pet.set_happy()
+            self.pet.observe_user_message(text)
+            if text:
+                timer_request = parse_focus_timer_intent(text)
+                if timer_request:
+                    self.pet.start_focus_timer(
+                        timer_request["seconds"],
+                        label=timer_request.get("label") or "专注",
+                    )
+                    self.add_message(
+                        f"⏱ 已启动{timer_request.get('label', '专注')}定时：{timer_request['duration_text']}",
+                        is_user=False,
+                    )
+                    self.send_btn.setEnabled(True)
+                    self.send_btn.setText("发送")
+                    return
             
         # 禁用发送按钮，防止重复提交
         self.send_btn.setEnabled(False)
@@ -3089,7 +3141,7 @@ class ChatWindow(QWidget):
 
         # 并行启动 MCP 风格的工具路由线程：让模型自己判断该不该把这句话写成待办。
         # 仅在有文字输入时跑（纯图片消息基本不会触发"加待办"意图）。
-        if text:
+        if text and not timer_request:
             self.tool_router_thread = TodoToolRouterThread(text, todo_store())
             self.tool_router_thread.result_signal.connect(self.on_tool_router_done)
             self.tool_router_thread.error_signal.connect(self.on_tool_router_error)
@@ -3137,6 +3189,62 @@ class ChatWindow(QWidget):
         # 工具路由失败不打扰用户：只打日志，不在聊天里弹错误。
         print(f"[ToolRouter] 失败: {error_msg}")
 
+    def _record_reply_feedback(self, msg_widget, value):
+        try:
+            msg_widget.feedback = value
+            record = {
+                "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+                "message_id": getattr(msg_widget, "msg_id", ""),
+                "feedback": int(value),
+                "user_text": getattr(msg_widget, "feedback_user_text", ""),
+                "assistant_text": getattr(msg_widget, "feedback_assistant_text", ""),
+                "source": "chat_feedback",
+            }
+            with open(self.feedback_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            up = getattr(msg_widget, "feedback_up_btn", None)
+            down = getattr(msg_widget, "feedback_down_btn", None)
+            if up:
+                up.setText("赞" if value != 1 else "赞✓")
+            if down:
+                down.setText("踩" if value != -1 else "踩✓")
+        except Exception as e:
+            print(f"[Feedback] 记录失败: {e}")
+
+    def _build_feedback_buttons(self, msg_widget):
+        box = QWidget()
+        layout = QHBoxLayout(box)
+        layout.setContentsMargins(0, 2, 0, 0)
+        layout.setSpacing(4)
+        up_btn = QPushButton("赞")
+        down_btn = QPushButton("踩")
+        for btn in (up_btn, down_btn):
+            btn.setFixedSize(32, 24)
+            btn.setToolTip("记录这条回复是否合你心意，用于后续偏好学习")
+            btn.setStyleSheet("""
+                QPushButton {
+                    background: #07090D;
+                    color: #C6D4E2;
+                    border: 1px solid #46586B;
+                    border-radius: 4px;
+                    font-size: 12px;
+                    padding: 1px;
+                }
+                QPushButton:hover {
+                    background: #101724;
+                    color: #F1EBDD;
+                    border-color: #9FB7CC;
+                }
+            """)
+        up_btn.clicked.connect(lambda: self._record_reply_feedback(msg_widget, 1))
+        down_btn.clicked.connect(lambda: self._record_reply_feedback(msg_widget, -1))
+        msg_widget.feedback_up_btn = up_btn
+        msg_widget.feedback_down_btn = down_btn
+        layout.addWidget(up_btn)
+        layout.addWidget(down_btn)
+        layout.addStretch()
+        return box
+
     def add_message(self, text, is_user=True, image_path=None):
         msg_widget = QWidget()
         msg_widget.setStyleSheet("background: transparent;")
@@ -3144,6 +3252,7 @@ class ChatWindow(QWidget):
         msg_widget.audio_path = None
         msg_widget.tts_thread = None
         msg_widget.is_user = is_user
+        msg_widget.feedback = 0
         h_layout = QHBoxLayout(msg_widget)
         h_layout.setContentsMargins(0, 0, 0, 0)
         
@@ -3166,11 +3275,13 @@ class ChatWindow(QWidget):
             """)
         else:
             # 如果图片不存在，回退到文字/emoji 占位
-            avatar.setText("👤" if is_user else "🐱")
+            avatar.setText("我" if is_user else "有")
             avatar.setStyleSheet(f"""
-                background-color: {'#E2E2E2' if is_user else '#FFF'};
+                background-color: {'#20162E' if is_user else '#07090D'};
+                color: #F1EBDD;
+                border: 1px solid #46586B;
                 border-radius: 6px;
-                font-size: 20px;
+                font-size: 14px;
             """)
         
         # 消息内容容器
@@ -3185,6 +3296,9 @@ class ChatWindow(QWidget):
             remote_image_urls = re.findall(pattern, text)
             # 从原文本中移除 markdown 语法
             text = re.sub(pattern, "", text).strip()
+        if not is_user:
+            msg_widget.feedback_user_text = self.last_user_message_for_feedback
+            msg_widget.feedback_assistant_text = text or ""
 
         # 根据是否有文字或是否是文件决定气泡的边距
         if text or (image_path and not image_path.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp'))):
@@ -3225,14 +3339,14 @@ class ChatWindow(QWidget):
             else:
                 # 文档类型，显示文件卡片
                 file_name = os.path.basename(image_path)
-                file_label = QLabel(f"📄 {file_name}")
+                file_label = QLabel(f"文件 {file_name}")
                 file_label.setStyleSheet("""
-                    background-color: #F8F8F8;
-                    border: 1px solid #D3D3D3;
+                    background-color: #07090D;
+                    border: 1px solid #46586B;
                     border-radius: 6px;
                     padding: 8px;
                     font-size: 14px;
-                    color: #333;
+                    color: #F1EBDD;
                 """)
                 bubble_layout.addWidget(file_label)
             
@@ -3248,7 +3362,7 @@ class ChatWindow(QWidget):
             bubble.setStyleSheet("""
                 font-size: 14px;
                 font-family: "Microsoft YaHei";
-                color: #333;
+                color: #F1EBDD;
                 border: none;
                 background: transparent;
             """)
@@ -3257,7 +3371,7 @@ class ChatWindow(QWidget):
         # 异步加载远程图片
         for url in remote_image_urls:
             img_label = QLabel("加载图片中...")
-            img_label.setStyleSheet("color: #888; font-style: italic; background: transparent; border: none;")
+            img_label.setStyleSheet("color: #A8AEB8; font-style: italic; background: transparent; border: none;")
             bubble_layout.addWidget(img_label)
             
             downloader = ImageDownloader(url, img_label)
@@ -3280,10 +3394,11 @@ class ChatWindow(QWidget):
             downloader.start()
         
         if is_user:
-            # 用户：靠右，绿色气泡
+            # 用户：靠右
             if text or (image_path and not image_path.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp'))):
                 bubble_container.setStyleSheet("""
-                    background-color: #95EC69;
+                    background-color: #20162E;
+                    border: 1px solid #775E90;
                     border-radius: 8px;
                 """)
             else:
@@ -3292,10 +3407,11 @@ class ChatWindow(QWidget):
             h_layout.addWidget(bubble_container)
             h_layout.addWidget(avatar)
         else:
-            # 机器人：靠左，白色气泡
+            # 机器人：靠左
             if text:
                 bubble_container.setStyleSheet("""
-                    background-color: white;
+                    background-color: #07090D;
+                    border: 1px solid #46586B;
                     border-radius: 8px;
                 """)
             else:
@@ -3309,6 +3425,7 @@ class ChatWindow(QWidget):
                 speaker_btn = self._build_speaker_button(msg_widget, text)
                 msg_widget.speaker_btn = speaker_btn
                 h_layout.addWidget(speaker_btn, 0, Qt.AlignTop)
+                bubble_layout.addWidget(self._build_feedback_buttons(msg_widget))
 
             h_layout.addStretch()
 
@@ -3339,16 +3456,17 @@ class ChatWindow(QWidget):
         btn.setStyleSheet("""
             QPushButton {
                 background-color: transparent;
-                border: none;
+                border: 1px solid transparent;
+                border-radius: 13px;
                 font-size: 16px;
-                color: #888;
+                color: #9FB7CC;
             }
             QPushButton:hover {
-                background-color: #EAEAEA;
-                border-radius: 13px;
+                background-color: #101724;
+                border-color: #46586B;
             }
             QPushButton:disabled {
-                color: #BBB;
+                color: #46586B;
             }
         """)
         btn.setEnabled(False)
@@ -3432,10 +3550,29 @@ class ChatWindow(QWidget):
     # ------- 删消息（带音频缓存一起清） -------
     def _show_msg_context_menu(self, msg_widget, pos):
         menu = QMenu(self)
-        act_del = menu.addAction("🗑 删除这条消息")
+        menu.setStyleSheet("""
+            QMenu {
+                background-color: #050607;
+                color: #F1EBDD;
+                border: 1px solid #46586B;
+                border-radius: 8px;
+                padding: 6px;
+                font-size: 13px;
+            }
+            QMenu::item {
+                padding: 8px 24px;
+                border-radius: 6px;
+                background: transparent;
+            }
+            QMenu::item:selected {
+                background-color: #20162E;
+                color: #F1EBDD;
+            }
+        """)
+        act_del = menu.addAction("删除这条消息")
         act_replay = None
         if getattr(msg_widget, "audio_path", None):
-            act_replay = menu.addAction("🔊 重新播放")
+            act_replay = menu.addAction("重新播放")
         chosen = menu.exec_(msg_widget.mapToGlobal(pos))
         if chosen is act_del:
             self._delete_message_widget(msg_widget)
@@ -3476,1271 +3613,6 @@ class ChatWindow(QWidget):
         scrollbar = self.scroll_area.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
-
-# ==================== MCP 工具 / A2UI 协议适配层 ====================
-# 说明：
-#   - 本模块在桌宠进程内提供"MCP 风格"的工具注册表（in-process，非真实的 MCP transport），
-#     供大模型在对话时按规则触发"add_todo"工具。
-#   - 工具调用的产物用 A2UI v0.9 协议（https://a2ui.org/specification/v0.9-a2ui/）来描述
-#     "对待办清单这块 UI surface 的更新"，由前端 TodoWindow 解释执行。
-#   - 写入前会做"字面 + 语义"双重去重，避免重复待办。
-
-A2UI_VERSION = "v0.9"
-A2UI_CATALOG_ID = "https://yuzu.pet/1.0/todocatalog"
-A2UI_SURFACE_TODO = "todo_list"
-
-
-def get_mcp_tool_definitions():
-    """返回 MCP 风格的工具描述列表。会被注入到工具路由 LLM 的 system prompt 里。"""
-    return [
-        {
-            "name": "add_todo",
-            "description": (
-                "向用户的待办清单写入一条新待办。"
-                "仅在用户**明确**表达想要做某事、记下某事、提醒自己、"
-                "在某截止时间前完成某事时调用。"
-                "不要为聊天闲聊、问候、纯提问、回忆过去的事调用。"
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "text": {"type": "string", "description": "待办的核心内容,一句话概括"},
-                    "priority": {
-                        "type": "string",
-                        "enum": ["low", "medium", "high"],
-                        "description": "紧急程度,默认 medium",
-                    },
-                    "category": {
-                        "type": "string",
-                        "enum": ["work", "study", "life", "homework", "other"],
-                        "description": "分类,默认 other",
-                    },
-                    "due_date": {
-                        "type": "string",
-                        "description": "截止时间,格式 YYYY-MM-DD 或 YYYY-MM-DD HH:MM,无可留空",
-                    },
-                    "tags": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "可选标签",
-                    },
-                },
-                "required": ["text"],
-            },
-        },
-    ]
-
-
-def _extract_first_json_object(text):
-    """容错地从 LLM 输出里提取出第一个完整的 JSON 对象。"""
-    if not text:
-        return None
-    s = text.strip()
-    s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.IGNORECASE)
-    s = re.sub(r"\s*```\s*$", "", s)
-    try:
-        return json.loads(s)
-    except Exception:
-        pass
-    depth = 0
-    start = -1
-    in_str = False
-    esc = False
-    for i, c in enumerate(s):
-        if in_str:
-            if esc:
-                esc = False
-            elif c == "\\":
-                esc = True
-            elif c == '"':
-                in_str = False
-            continue
-        if c == '"':
-            in_str = True
-            continue
-        if c == "{":
-            if depth == 0:
-                start = i
-            depth += 1
-        elif c == "}":
-            if depth > 0:
-                depth -= 1
-                if depth == 0 and start >= 0:
-                    candidate = s[start:i + 1]
-                    try:
-                        return json.loads(candidate)
-                    except Exception:
-                        start = -1
-    return None
-
-
-# ---- 中央待办存储：A2UI 消息 / 工具调用都通过它落盘 + 通知 UI ----
-class TodoStore(QObject):
-    """A2UI 驱动的中央 Todo 存储。
-
-    数据格式（新）：
-        {
-          "version": "1.0",
-          "items": [
-            {"id", "text", "completed", "priority", "category",
-             "tags": [...], "endtime", "teacher", "is_homework",
-             "created_at", "source"}
-          ]
-        }
-    旧的纯 list 格式会被自动迁移。
-    """
-
-    DATA_FILE = "todo_data.json"
-    DEDUP_SIM_THRESHOLD = 0.82
-
-    todos_changed = pyqtSignal()
-    todo_added = pyqtSignal(dict)
-
-    PRIORITY_ORDER = {"high": 0, "medium": 1, "low": 2}
-
-    def __init__(self):
-        super().__init__()
-        self.items = []
-        # 关键：工具路由线程(后台) 与 主线程都会调用 add/remove/save，
-        # 用一把可重入锁保证 self.items 读写、JSON 落盘原子化。
-        self._lock = threading.RLock()
-        self._load()
-
-    # ----- IO -----
-    def _load(self):
-        if not os.path.exists(self.DATA_FILE):
-            return
-        try:
-            with open(self.DATA_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception as e:
-            print(f"[TodoStore] 加载失败: {e}")
-            return
-        raw_items = []
-        if isinstance(data, list):
-            raw_items = data
-        elif isinstance(data, dict):
-            raw_items = data.get("items", []) or []
-        out = []
-        for it in raw_items:
-            if isinstance(it, str):
-                out.append(self._normalize({"text": it}))
-            elif isinstance(it, dict):
-                out.append(self._normalize(it))
-        with self._lock:
-            self.items = out
-
-    def save(self):
-        try:
-            with self._lock:
-                payload = {"version": "1.0", "items": list(self.items)}
-            with open(self.DATA_FILE, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            print(f"[TodoStore] 保存失败: {e}")
-
-    def _normalize(self, raw):
-        is_hw = bool(raw.get("is_homework", False))
-        text = (raw.get("text") or "").strip()
-        return {
-            "id": raw.get("id") or f"todo_{uuid.uuid4().hex[:10]}",
-            "text": text,
-            "completed": bool(raw.get("completed", False)),
-            "is_homework": is_hw,
-            "teacher": raw.get("teacher", "") or "",
-            "endtime": raw.get("endtime", "") or raw.get("due_date", "") or "",
-            "priority": raw.get("priority") if raw.get("priority") in ("low", "medium", "high") else ("high" if is_hw else "medium"),
-            "category": raw.get("category") or ("homework" if is_hw else "other"),
-            "tags": list(raw["tags"]) if isinstance(raw.get("tags"), list) else [],
-            "created_at": raw.get("created_at") or datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "source": raw.get("source") or ("homework" if is_hw else "user"),
-        }
-
-    # ----- 查询 -----
-    def all(self):
-        with self._lock:
-            return list(self.items)
-
-    @staticmethod
-    def _norm_text(s):
-        s = (s or "").strip().lower()
-        return re.sub(r"\s+", "", s)
-
-    def find_similar(self, text):
-        """字面 + 模糊去重。返回相似的 item 或 None。"""
-        try:
-            from difflib import SequenceMatcher
-        except Exception:
-            SequenceMatcher = None
-        target = self._norm_text(text)
-        if not target:
-            return None
-        with self._lock:
-            snapshot = list(self.items)
-        for it in snapshot:
-            existing = self._norm_text(it.get("text"))
-            if not existing:
-                continue
-            if existing == target:
-                return it
-            # 一方完整包含另一方且长度差不大 → 视为同一条
-            if (target in existing or existing in target) and abs(len(existing) - len(target)) <= max(4, int(len(target) * 0.3)):
-                return it
-            if SequenceMatcher is not None:
-                try:
-                    ratio = SequenceMatcher(None, target, existing).ratio()
-                except Exception:
-                    ratio = 0.0
-                if ratio >= self.DEDUP_SIM_THRESHOLD:
-                    return it
-        return None
-
-    # ----- 写入 -----
-    def add(self, raw_item, dedup=True):
-        """添加一条 todo。返回 (added: bool, item_or_dup: dict)。"""
-        item = self._normalize(raw_item)
-        if not item["text"]:
-            return False, None
-        with self._lock:
-            if dedup:
-                dup = self.find_similar(item["text"])
-                if dup is not None:
-                    return False, dup
-            self.items.append(item)
-        self.save()
-        self.todo_added.emit(item)
-        self.todos_changed.emit()
-        return True, item
-
-    def remove(self, todo_id):
-        with self._lock:
-            n = len(self.items)
-            self.items = [it for it in self.items if it.get("id") != todo_id]
-            changed = len(self.items) != n
-        if changed:
-            self.save()
-            self.todos_changed.emit()
-        return changed
-
-    def set_completed(self, todo_id, completed):
-        changed = False
-        with self._lock:
-            for it in self.items:
-                if it.get("id") == todo_id:
-                    if bool(it.get("completed")) != bool(completed):
-                        it["completed"] = bool(completed)
-                        changed = True
-                    break
-        if changed:
-            self.save()
-            self.todos_changed.emit()
-            return True
-        return False
-
-    def clear_completed(self):
-        with self._lock:
-            before = len(self.items)
-            self.items = [it for it in self.items if not it.get("completed")]
-            changed = len(self.items) != before
-        if changed:
-            self.save()
-            self.todos_changed.emit()
-
-    # ----- A2UI 消息解释执行 -----
-    def apply_a2ui_message(self, msg):
-        """解释一条 A2UI v0.9 消息，返回真正落库的 items 列表。
-
-        我们关心的两类 update：
-        - updateDataModel: surfaceId=todo_list, path=/items/-, value=dict 或 list[dict]
-        - updateComponents: 仅用于显示，不影响数据；忽略。
-        其他类型（createSurface/deleteSurface）忽略。
-        """
-        if not isinstance(msg, dict):
-            return []
-        added = []
-        # 兼容批量包装
-        if "messages" in msg and isinstance(msg["messages"], list):
-            for m in msg["messages"]:
-                added.extend(self.apply_a2ui_message(m))
-            return added
-
-        udm = msg.get("updateDataModel")
-        if isinstance(udm, dict):
-            if udm.get("surfaceId") in (None, A2UI_SURFACE_TODO):
-                path = udm.get("path", "/items/-")
-                value = udm.get("value")
-                values = []
-                if isinstance(value, list):
-                    values = [v for v in value if isinstance(v, dict)]
-                elif isinstance(value, dict):
-                    if path in ("/items", "/"):
-                        # 整个数据模型被替换的情况：把 items 取出来
-                        nested = value.get("items")
-                        if isinstance(nested, list):
-                            values = [v for v in nested if isinstance(v, dict)]
-                        else:
-                            values = [value]
-                    else:
-                        values = [value]
-                for v in values:
-                    ok, item = self.add(v, dedup=True)
-                    if ok and item is not None:
-                        added.append(item)
-        return added
-
-
-# 全局单例
-_todo_store_instance = None
-
-
-def todo_store():
-    global _todo_store_instance
-    if _todo_store_instance is None:
-        _todo_store_instance = TodoStore()
-    return _todo_store_instance
-
-
-# ==================== Todo 工具路由线程 ====================
-class TodoToolRouterThread(QThread):
-    """独立的 LLM 工具路由线程：
-    - 输入：用户最近一次输入 + 当前 todo 清单
-    - 输出：(added_items, skipped_items)，已经写入 TodoStore
-    """
-
-    result_signal = pyqtSignal(list, list)
-    error_signal = pyqtSignal(str)
-
-    def __init__(self, user_text, store):
-        super().__init__()
-        self.user_text = (user_text or "").strip()
-        self.store = store
-
-    def run(self):
-        try:
-            if not self.user_text:
-                self.result_signal.emit([], [])
-                return
-
-            tools_json = json.dumps(get_mcp_tool_definitions(), ensure_ascii=False, indent=2)
-            existing = [
-                {"text": it["text"], "category": it.get("category", "")}
-                for it in self.store.items
-                if not it.get("completed")
-            ][-30:]
-            existing_json = json.dumps(existing, ensure_ascii=False, indent=2)
-            today_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
-
-            sys_prompt = f"""你是一个 MCP 风格的工具路由器，专门判断"用户的最新输入是否需要调用工具"，并按 A2UI v0.9 协议输出 UI 更新消息。
-
-当前时间: {today_str}
-
-【可用工具(MCP inputSchema 风格)】:
-{tools_json}
-
-【当前用户未完成的待办清单(用于去重判断)】:
-{existing_json}
-
-【A2UI v0.9 写入约定】:
-- catalogId = "{A2UI_CATALOG_ID}"
-- surfaceId = "{A2UI_SURFACE_TODO}"
-- 每新增一条 todo, 对应一条 updateDataModel 消息, path 固定为 "/items/-", value 为一个 todo 对象。
-
-【触发规则 - 必须严格遵守】:
-1. 仅当用户明确表达"要做/要记下/要提醒/要安排/要在某截止前完成"等添加意图时, 才输出 add_todo 调用。
-2. 闲聊、问候、提问、感叹、回忆已经发生的事 → 不调用任何工具, 返回空列表。
-3. 用户描述的事项若与【当前未完成的待办清单】中**任意一条语义重复**(同义/包含关系/同一件事的不同说法), 不要再次添加。
-4. 一次最多 3 条。每条 text 控制在 30 个字以内, 不要复述用户原话, 提炼出待办主干。
-5. 如果用户提到"明天/后天/周一/下午三点"等相对时间, 请基于"当前时间"换算成绝对时间放入 due_date(格式 YYYY-MM-DD 或 YYYY-MM-DD HH:MM); 不确定就留空字符串。
-
-【输出格式 - 必须是纯 JSON, 不要 markdown 围栏, 不要解释】:
-没有需要添加的待办时, 严格输出:
-{{"tool_calls": [], "a2ui_messages": []}}
-
-需要添加时(示例, 字段必须齐全):
-{{
-  "tool_calls": [
-    {{"name": "add_todo", "arguments": {{"text": "复习数据库 ER 图", "priority": "high", "category": "study", "due_date": "2026-05-15 22:00", "tags": ["期末"]}}}}
-  ],
-  "a2ui_messages": [
-    {{
-      "version": "{A2UI_VERSION}",
-      "updateDataModel": {{
-        "surfaceId": "{A2UI_SURFACE_TODO}",
-        "path": "/items/-",
-        "value": {{
-          "text": "复习数据库 ER 图",
-          "priority": "high",
-          "category": "study",
-          "due_date": "2026-05-15 22:00",
-          "tags": ["期末"],
-          "source": "agent"
-        }}
-      }}
-    }}
-  ]
-}}"""
-
-            tool_llm = ChatOpenAI(
-                model=app_config.get("ark.model_tool", "") or "doubao-seed-2-0-mini-260428",
-                openai_api_key=app_config.get("ark.api_key", "") or "",
-                openai_api_base=app_config.get("ark.base_url", "") or "https://ark.cn-beijing.volces.com/api/v3",
-                max_tokens=600,
-                temperature=0.0,
-                model_kwargs={"extra_body": {"thinking": {"type": "disabled"}}},
-            )
-            sys_message = SystemMessage(content=sys_prompt)
-            user_message = HumanMessage(content=f"用户输入: {self.user_text}")
-
-            t0 = time.perf_counter()
-            resp = tool_llm.invoke([sys_message, user_message])
-            raw = (resp.content or "").strip()
-            print(f"[ToolRouter][{time.perf_counter()-t0:.2f}s] raw={raw[:600]}")
-
-            parsed = _extract_first_json_object(raw)
-            if not parsed:
-                self.result_signal.emit([], [])
-                return
-
-            messages = parsed.get("a2ui_messages") or []
-            tool_calls = parsed.get("tool_calls") or []
-
-            # 兜底：LLM 只给了 tool_calls 没给 a2ui_messages，本地补
-            if not messages and tool_calls:
-                for tc in tool_calls:
-                    if not isinstance(tc, dict):
-                        continue
-                    if tc.get("name") != "add_todo":
-                        continue
-                    args = tc.get("arguments") or {}
-                    if isinstance(args, str):
-                        try:
-                            args = json.loads(args)
-                        except Exception:
-                            args = {}
-                    if not isinstance(args, dict):
-                        continue
-                    messages.append({
-                        "version": A2UI_VERSION,
-                        "updateDataModel": {
-                            "surfaceId": A2UI_SURFACE_TODO,
-                            "path": "/items/-",
-                            "value": {
-                                "text": (args.get("text") or "").strip(),
-                                "priority": args.get("priority", "medium"),
-                                "category": args.get("category", "other"),
-                                "endtime": args.get("due_date", ""),
-                                "tags": args.get("tags", []) if isinstance(args.get("tags"), list) else [],
-                                "source": "agent",
-                            },
-                        },
-                    })
-
-            added_items = []
-            for m in messages:
-                added_items.extend(self.store.apply_a2ui_message(m))
-
-            # 计算被跳过(LLM 想加但因去重被拦下)
-            skipped_items = []
-            wanted_texts = []
-            for tc in tool_calls:
-                if isinstance(tc, dict) and tc.get("name") == "add_todo":
-                    args = tc.get("arguments")
-                    if isinstance(args, str):
-                        try:
-                            args = json.loads(args)
-                        except Exception:
-                            args = {}
-                    if isinstance(args, dict):
-                        t = (args.get("text") or "").strip()
-                        if t:
-                            wanted_texts.append(t)
-            added_norm = {self.store._norm_text(it["text"]) for it in added_items}
-            for t in wanted_texts:
-                if self.store._norm_text(t) not in added_norm:
-                    dup = self.store.find_similar(t)
-                    if dup is not None:
-                        skipped_items.append({"text": t, "reason": f"与已有「{dup['text']}」重复"})
-
-            self.result_signal.emit(added_items, skipped_items)
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            self.error_signal.emit(str(e))
-
-
-# ==================== To-Do List 窗口 ====================
-class HomeworkFetcherThread(QThread):
-    finished_signal = pyqtSignal(list)
-    error_signal = pyqtSignal(str)
-
-    def run(self):
-        try:
-            # 优学院的几条 URL + 账号密码全部来自 AppConfig；都没填就直接报错给 UI。
-            homework_url = app_config.get("ucollege.homework_url", "") or ""
-            clas         = app_config.get("ucollege.course_list_url", "") or ""
-            lg_url       = app_config.get("ucollege.login_url", "") or ""
-            login_name   = app_config.get("ucollege.login_name", "") or ""
-            login_pwd    = app_config.get("ucollege.password", "") or ""
-            if not (homework_url and clas and lg_url and login_name and login_pwd):
-                self.error_signal.emit("优学院相关字段未填全。请右键桌宠 → ⚙ 设置 → 优学院作业拉取。")
-                return
-
-            session = requests.Session()
-            lg_data = {
-                "loginName": login_name,
-                "password": login_pwd,
-            }
-            login_response = session.post(lg_url, data=lg_data)
-            
-            if login_response.status_code == 200:
-                token = session.cookies.get("token")
-                headers = {"Authorization": token}
-                
-                res = session.get(clas, headers=headers)
-                course_list = res.json().get("courseList", [])
-                
-                all_homeworks = []
-                for course in course_list:
-                    cid = course["id"]
-                    params = {"ocId": cid, "pn": 1, "ps": 10, "Lang": "zh"}
-                    howurl = homework_url.format(course_id=cid)
-                    homework_response = session.get(howurl, headers=headers, params=params)
-                    data = homework_response.json()
-                    homework_list = data.get("homeworkList", [])
-                    
-                    for hw in homework_list:
-                        status = hw.get("status")
-                        if status in [1, 2]:  # 1: 未开始, 2: 未提交
-                            title = hw.get("homeworkTitle", "未命名作业")
-                            teacher = hw.get("publisher", "未知")
-                            endtime = hw.get("endTime", 0) / 1000
-                            if endtime > 0:
-                                dt_utc = datetime.datetime.fromtimestamp(endtime, tz=datetime.timezone.utc)
-                                dt_beijing = dt_utc.astimezone(datetime.timezone(datetime.timedelta(hours=8)))
-                                formatted_time = dt_beijing.strftime("%Y-%m-%d %H:%M:%S")
-                            else:
-                                formatted_time = "无截止时间"
-                            
-                            all_homeworks.append({
-                                "text": title,
-                                "is_homework": True,
-                                "teacher": teacher,
-                                "endtime": formatted_time,
-                                "completed": False,
-                                "priority": "high",
-                                "category": "homework",
-                                "source": "homework",
-                            })
-                
-                self.finished_signal.emit(all_homeworks)
-            else:
-                self.error_signal.emit("登录失败")
-        except Exception as e:
-            self.error_signal.emit(str(e))
-
-
-# ---- 单条 Todo 卡片（新版 UI 的核心可视化组件） ----
-class TodoItemCard(QFrame):
-    """新 UI 中每一条待办都是一张可缩放的卡片，承载：
-    - 复选框（完成态）
-    - 优先级竖条（颜色编码）
-    - 分类徽标 / 标签 chip
-    - 截止时间 / 任课老师 副信息
-    - 删除按钮
-    点击卡片本身（非按钮区）会切换 completed 状态。
-    """
-
-    PRIORITY_COLORS = {
-        "high":   "#FF6B6B",
-        "medium": "#FFB347",
-        "low":    "#7FCFE8",
-    }
-    CATEGORY_META = {
-        "work":     ("💼 工作", "#5C9DEB"),
-        "study":    ("📚 学习", "#A084E8"),
-        "life":     ("🏡 生活", "#85D88B"),
-        "homework": ("🎓 作业", "#F4A261"),
-        "other":    ("📌 其他", "#9BA3AD"),
-    }
-    SOURCE_BADGE = {
-        "agent":    ("🤖 AI", "#7AC4F7"),
-        "homework": ("📥 同步", "#F4A261"),
-    }
-
-    completed_changed = pyqtSignal(str, bool)
-    delete_requested = pyqtSignal(str)
-
-    def __init__(self, item, parent=None):
-        super().__init__(parent)
-        self.item = item
-        self.setObjectName("todoCard")
-        self._build_ui()
-
-    def _build_ui(self):
-        item = self.item
-        priority = item.get("priority", "medium")
-        completed = bool(item.get("completed"))
-        category = item.get("category", "other")
-        is_hw = bool(item.get("is_homework"))
-
-        bar_color = self.PRIORITY_COLORS.get(priority, "#FFB347")
-        bg = "#F4F5F7" if completed else "#FFFFFF"
-
-        self.setStyleSheet(f"""
-            QFrame#todoCard {{
-                background-color: {bg};
-                border-left: 4px solid {bar_color};
-                border-radius: 10px;
-            }}
-            QFrame#todoCard:hover {{
-                background-color: #FFF8EC;
-            }}
-        """)
-
-        outer = QHBoxLayout(self)
-        outer.setContentsMargins(10, 8, 8, 8)
-        outer.setSpacing(8)
-
-        # ----- 复选框 -----
-        self.checkbox = QCheckBox()
-        self.checkbox.setChecked(completed)
-        self.checkbox.setStyleSheet(f"""
-            QCheckBox {{ background: transparent; spacing: 0; }}
-            QCheckBox::indicator {{
-                width: 18px; height: 18px;
-                border-radius: 9px;
-                border: 2px solid {bar_color};
-                background: white;
-            }}
-            QCheckBox::indicator:checked {{
-                background-color: #4CAF50;
-                border-color: #4CAF50;
-                image: none;
-            }}
-        """)
-        self.checkbox.toggled.connect(self._on_toggled)
-        cb_wrap = QVBoxLayout()
-        cb_wrap.setContentsMargins(0, 2, 0, 0)
-        cb_wrap.addWidget(self.checkbox)
-        cb_wrap.addStretch()
-        outer.addLayout(cb_wrap)
-
-        # ----- 文字 + 元信息 -----
-        text_layout = QVBoxLayout()
-        text_layout.setSpacing(3)
-        text_layout.setContentsMargins(0, 0, 0, 0)
-
-        # 标题
-        text_color = "#9CA3AF" if completed else "#1F2937"
-        self.title_label = QLabel(item.get("text", ""))
-        self.title_label.setWordWrap(True)
-        self.title_label.setStyleSheet(
-            f"font-size: 13px; font-weight: bold; color: {text_color}; "
-            f"background: transparent; "
-            f"{'text-decoration: line-through;' if completed else ''}"
-        )
-        text_layout.addWidget(self.title_label)
-
-        # 元信息行（分类徽标 / 来源 / 标签）
-        chips_row = QHBoxLayout()
-        chips_row.setSpacing(4)
-        chips_row.setContentsMargins(0, 0, 0, 0)
-
-        cat_label, cat_color = self.CATEGORY_META.get(category, self.CATEGORY_META["other"])
-        chips_row.addWidget(self._make_chip(cat_label, cat_color))
-
-        src = item.get("source")
-        if src in self.SOURCE_BADGE:
-            sb_label, sb_color = self.SOURCE_BADGE[src]
-            chips_row.addWidget(self._make_chip(sb_label, sb_color))
-
-        for tag in (item.get("tags") or [])[:3]:
-            chips_row.addWidget(self._make_chip(f"#{tag}", "#9BA3AD"))
-
-        chips_row.addStretch()
-        if any([category, src in self.SOURCE_BADGE, item.get("tags")]):
-            text_layout.addLayout(chips_row)
-
-        # 截止/老师 副信息
-        detail_parts = []
-        if is_hw and item.get("teacher"):
-            detail_parts.append(f"👨‍🏫 {item['teacher']}")
-        if item.get("endtime"):
-            detail_parts.append(f"⏰ {item['endtime']}")
-        if detail_parts:
-            details_label = QLabel("  ·  ".join(detail_parts))
-            details_label.setWordWrap(True)
-            details_label.setStyleSheet(
-                "color: #6B7280; font-size: 11px; background: transparent;"
-            )
-            text_layout.addWidget(details_label)
-
-        outer.addLayout(text_layout, 1)
-
-        # ----- 删除按钮 -----
-        self.del_btn = QPushButton("🗑")
-        self.del_btn.setFixedSize(28, 28)
-        self.del_btn.setCursor(Qt.PointingHandCursor)
-        self.del_btn.setStyleSheet("""
-            QPushButton {
-                background: transparent;
-                border: none;
-                font-size: 14px;
-                color: #9CA3AF;
-            }
-            QPushButton:hover {
-                background-color: #FFE4E4;
-                color: #DC2626;
-                border-radius: 14px;
-            }
-        """)
-        self.del_btn.clicked.connect(lambda: self.delete_requested.emit(self.item["id"]))
-        del_wrap = QVBoxLayout()
-        del_wrap.setContentsMargins(0, 0, 0, 0)
-        del_wrap.addWidget(self.del_btn)
-        del_wrap.addStretch()
-        outer.addLayout(del_wrap)
-
-    @staticmethod
-    def _make_chip(text, color):
-        lbl = QLabel(text)
-        lbl.setStyleSheet(
-            f"background-color: {color}22;"
-            f"color: {color};"
-            f"border-radius: 8px;"
-            f"padding: 1px 6px;"
-            f"font-size: 10px;"
-            f"font-weight: bold;"
-        )
-        return lbl
-
-    def _on_toggled(self, checked):
-        self.completed_changed.emit(self.item["id"], bool(checked))
-
-class TodoWindow(QWidget):
-    """新版待办清单窗口。
-    - 数据层走 TodoStore 单例（A2UI 消息和 LLM 工具调用都能直接写入）。
-    - UI 升级：搜索、状态/分类过滤、卡片化每项、优先级颜色、分类徽标、标签 chip。
-    - 拖拽：在顶部 header 区域按住才能移动，避免和列表/按钮冲突。
-    """
-
-    STATUS_FILTERS = [
-        ("all",     "全部"),
-        ("pending", "未完成"),
-        ("done",    "已完成"),
-        ("today",   "今日"),
-    ]
-    CATEGORY_FILTERS = [
-        ("all",      "全部分类"),
-        ("homework", "🎓 作业"),
-        ("study",    "📚 学习"),
-        ("work",     "💼 工作"),
-        ("life",     "🏡 生活"),
-        ("other",    "📌 其他"),
-    ]
-
-    def __init__(self, pet=None):
-        super().__init__()
-        self.pet = pet
-        self.store = todo_store()
-        self.drag_offset = QPoint()
-        self._drag_anchor = None
-        self.current_status = "all"
-        self.current_category = "all"
-        self.search_text = ""
-        self._connected = False
-        self.init_ui()
-        self._connect_store()
-        self.refresh_list()
-
-    # ----- Store 连接 / 断开 -----
-    def _connect_store(self):
-        if self._connected:
-            return
-        self.store.todos_changed.connect(self.refresh_list)
-        self.store.todo_added.connect(self._on_todo_added_flash)
-        self._connected = True
-
-    def _disconnect_store(self):
-        if not self._connected:
-            return
-        try:
-            self.store.todos_changed.disconnect(self.refresh_list)
-        except Exception:
-            pass
-        try:
-            self.store.todo_added.disconnect(self._on_todo_added_flash)
-        except Exception:
-            pass
-        self._connected = False
-
-    def closeEvent(self, event):
-        self._disconnect_store()
-        super().closeEvent(event)
-
-    # ----- UI 构建 -----
-    def init_ui(self):
-        self.setWindowTitle("有珠的待办清单")
-        self.setFixedSize(400, 600)
-        self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint)
-        self.setAttribute(Qt.WA_TranslucentBackground)
-
-        # 外圆角容器 + 投影
-        container = QWidget(self)
-        container.setObjectName("rootContainer")
-        container.setGeometry(10, 10, 380, 580)
-        container.setStyleSheet("""
-            QWidget#rootContainer {
-                background-color: #FFFBF1;
-                border-radius: 20px;
-            }
-        """)
-        shadow = QGraphicsDropShadowEffect()
-        shadow.setBlurRadius(28)
-        shadow.setColor(QColor(0, 0, 0, 70))
-        shadow.setOffset(0, 6)
-        container.setGraphicsEffect(shadow)
-
-        root = QVBoxLayout(container)
-        root.setContentsMargins(16, 14, 16, 14)
-        root.setSpacing(10)
-
-        # ============== 顶部标题栏 ==============
-        self.header = QWidget()
-        self.header.setObjectName("titleBar")
-        self.header.setFixedHeight(36)
-        self.header.setStyleSheet("QWidget#titleBar { background: transparent; }")
-        title_layout = QHBoxLayout(self.header)
-        title_layout.setContentsMargins(2, 0, 0, 0)
-        title_layout.setSpacing(6)
-
-        title = QLabel("📋 我的待办")
-        title.setFont(QFont("Microsoft YaHei", 14, QFont.Bold))
-        title.setStyleSheet("color: #E67E22; background: transparent;")
-        title_layout.addWidget(title)
-        title_layout.addStretch()
-
-        self.sync_btn = QPushButton("🔄 获取作业")
-        self.sync_btn.setFixedSize(86, 28)
-        self.sync_btn.setCursor(Qt.PointingHandCursor)
-        self.sync_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #4CAF50;
-                color: white;
-                border: none;
-                border-radius: 14px;
-                font-size: 12px;
-                font-weight: bold;
-            }
-            QPushButton:hover { background-color: #45a049; }
-        """)
-        self.sync_btn.clicked.connect(self.sync_homework)
-        title_layout.addWidget(self.sync_btn)
-
-        close_btn = QPushButton("✕")
-        close_btn.setFixedSize(28, 28)
-        close_btn.setCursor(Qt.PointingHandCursor)
-        close_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #FF6B6B;
-                color: white;
-                border: none;
-                border-radius: 14px;
-                font-size: 13px;
-                font-weight: bold;
-            }
-            QPushButton:hover { background-color: #EE5A5A; }
-        """)
-        close_btn.clicked.connect(self.close)
-        title_layout.addWidget(close_btn)
-        root.addWidget(self.header)
-
-        # ============== 概览卡片（动态统计） ==============
-        self.overview_label = QLabel()
-        self.overview_label.setWordWrap(True)
-        self.overview_label.setStyleSheet("""
-            background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                stop:0 #FFE9B6, stop:1 #FFD18A);
-            color: #6B4717;
-            border-radius: 12px;
-            padding: 10px 14px;
-            font-size: 12px;
-            font-weight: bold;
-        """)
-        root.addWidget(self.overview_label)
-
-        # ============== 输入行 ==============
-        input_layout = QHBoxLayout()
-        input_layout.setSpacing(6)
-        self.input_field = QLineEdit()
-        self.input_field.setPlaceholderText("✨ 添加新的待办事项...")
-        self.input_field.setStyleSheet("""
-            QLineEdit {
-                border: 2px solid #FFB347;
-                border-radius: 14px;
-                padding: 9px 14px;
-                font-size: 13px;
-                background-color: white;
-                color: #1F2937;
-            }
-            QLineEdit:focus { border-color: #E67E22; }
-        """)
-        self.input_field.returnPressed.connect(self.add_todo_from_input)
-        input_layout.addWidget(self.input_field, 1)
-
-        self.priority_combo = QComboBox()
-        self.priority_combo.addItem("🔥 高", "high")
-        self.priority_combo.addItem("• 中", "medium")
-        self.priority_combo.addItem("· 低", "low")
-        self.priority_combo.setCurrentIndex(1)
-        self.priority_combo.setFixedHeight(38)
-        self.priority_combo.setStyleSheet("""
-            QComboBox {
-                background-color: white;
-                border: 2px solid #FFD7A0;
-                border-radius: 14px;
-                padding: 0 8px;
-                font-size: 12px;
-                min-width: 64px;
-            }
-            QComboBox:focus { border-color: #E67E22; }
-            QComboBox::drop-down { width: 16px; border: none; }
-        """)
-        input_layout.addWidget(self.priority_combo)
-
-        add_btn = QPushButton("+")
-        add_btn.setFixedSize(38, 38)
-        add_btn.setCursor(Qt.PointingHandCursor)
-        add_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #FFB347;
-                color: white;
-                border: none;
-                border-radius: 19px;
-                font-size: 22px;
-                font-weight: bold;
-            }
-            QPushButton:hover { background-color: #E67E22; }
-        """)
-        add_btn.clicked.connect(self.add_todo_from_input)
-        input_layout.addWidget(add_btn)
-        root.addLayout(input_layout)
-
-        # ============== 搜索 + 分类 ==============
-        search_row = QHBoxLayout()
-        search_row.setSpacing(6)
-        self.search_field = QLineEdit()
-        self.search_field.setPlaceholderText("🔍 搜索待办 / 标签...")
-        self.search_field.setStyleSheet("""
-            QLineEdit {
-                border: 1px solid #E5E7EB;
-                border-radius: 10px;
-                padding: 6px 10px;
-                font-size: 12px;
-                background-color: white;
-                color: #374151;
-            }
-            QLineEdit:focus { border-color: #FFB347; }
-        """)
-        self.search_field.textChanged.connect(self._on_search_changed)
-        search_row.addWidget(self.search_field, 1)
-
-        self.category_combo = QComboBox()
-        for key, label in self.CATEGORY_FILTERS:
-            self.category_combo.addItem(label, key)
-        self.category_combo.setStyleSheet("""
-            QComboBox {
-                background-color: white;
-                border: 1px solid #E5E7EB;
-                border-radius: 10px;
-                padding: 4px 8px;
-                font-size: 12px;
-                min-width: 80px;
-            }
-            QComboBox:focus { border-color: #FFB347; }
-            QComboBox::drop-down { width: 16px; border: none; }
-        """)
-        self.category_combo.currentIndexChanged.connect(self._on_category_changed)
-        search_row.addWidget(self.category_combo)
-        root.addLayout(search_row)
-
-        # ============== 状态过滤 tab pills ==============
-        tab_row = QHBoxLayout()
-        tab_row.setSpacing(4)
-        self._status_btns = {}
-        for key, label in self.STATUS_FILTERS:
-            btn = QPushButton(label)
-            btn.setCursor(Qt.PointingHandCursor)
-            btn.setCheckable(True)
-            btn.setFixedHeight(26)
-            btn.clicked.connect(lambda _checked, k=key: self._set_status(k))
-            tab_row.addWidget(btn)
-            self._status_btns[key] = btn
-        tab_row.addStretch()
-        self.clear_done_btn = QPushButton("清理已完成")
-        self.clear_done_btn.setCursor(Qt.PointingHandCursor)
-        self.clear_done_btn.setFixedHeight(26)
-        self.clear_done_btn.setStyleSheet("""
-            QPushButton {
-                background-color: transparent;
-                color: #9CA3AF;
-                border: none;
-                font-size: 11px;
-            }
-            QPushButton:hover { color: #DC2626; text-decoration: underline; }
-        """)
-        self.clear_done_btn.clicked.connect(self._on_clear_done)
-        tab_row.addWidget(self.clear_done_btn)
-        root.addLayout(tab_row)
-        self._apply_status_styles()
-
-        # ============== 卡片列表（滚动区） ==============
-        self.scroll_area = QScrollArea()
-        self.scroll_area.setWidgetResizable(True)
-        self.scroll_area.setFrameShape(QFrame.NoFrame)
-        self.scroll_area.setStyleSheet("""
-            QScrollArea { background: transparent; border: none; }
-            QScrollArea > QWidget > QWidget { background: transparent; }
-            QScrollBar:vertical {
-                background: transparent; width: 6px; margin: 0;
-            }
-            QScrollBar::handle:vertical {
-                background: #F1B26B; border-radius: 3px; min-height: 24px;
-            }
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { background: none; border: none; }
-        """)
-        self.list_container = QWidget()
-        self.list_container.setStyleSheet("background: transparent;")
-        self.list_layout = QVBoxLayout(self.list_container)
-        self.list_layout.setContentsMargins(2, 2, 6, 2)
-        self.list_layout.setSpacing(6)
-        self.list_layout.addStretch()
-        self.scroll_area.setWidget(self.list_container)
-        root.addWidget(self.scroll_area, 1)
-
-        # ============== 底部 stats ==============
-        self.stats_label = QLabel("还没有待办事项哦~")
-        self.stats_label.setAlignment(Qt.AlignCenter)
-        self.stats_label.setStyleSheet("color: #9CA3AF; font-size: 11px; background: transparent;")
-        root.addWidget(self.stats_label)
-
-    # ----- 状态过滤按钮样式 -----
-    def _apply_status_styles(self):
-        for key, btn in self._status_btns.items():
-            active = key == self.current_status
-            btn.setChecked(active)
-            if active:
-                btn.setStyleSheet("""
-                    QPushButton {
-                        background-color: #FFB347;
-                        color: white;
-                        border: none;
-                        border-radius: 13px;
-                        padding: 0 12px;
-                        font-size: 11px;
-                        font-weight: bold;
-                    }
-                """)
-            else:
-                btn.setStyleSheet("""
-                    QPushButton {
-                        background-color: transparent;
-                        color: #6B7280;
-                        border: 1px solid #E5E7EB;
-                        border-radius: 13px;
-                        padding: 0 12px;
-                        font-size: 11px;
-                    }
-                    QPushButton:hover {
-                        border-color: #FFB347;
-                        color: #E67E22;
-                    }
-                """)
-
-    def _set_status(self, key):
-        self.current_status = key
-        self._apply_status_styles()
-        self.refresh_list()
-
-    def _on_category_changed(self, _idx):
-        self.current_category = self.category_combo.currentData() or "all"
-        self.refresh_list()
-
-    def _on_search_changed(self, text):
-        self.search_text = (text or "").strip().lower()
-        self.refresh_list()
-
-    def _on_clear_done(self):
-        self.store.clear_completed()
-        if self.pet:
-            self.pet.show_bubble("打扫干净啦~", duration=2500)
-
-    # ----- 数据 → UI -----
-    def _filtered_items(self):
-        items = self.store.all()
-        # 优先级排序：完成排后，再按优先级 high→low，最后按创建时间
-        items.sort(key=lambda x: (
-            bool(x.get("completed")),
-            self.store.PRIORITY_ORDER.get(x.get("priority", "medium"), 9),
-            x.get("created_at", ""),
-        ))
-        today = datetime.datetime.now().strftime("%Y-%m-%d")
-        result = []
-        for it in items:
-            if self.current_status == "pending" and it.get("completed"):
-                continue
-            if self.current_status == "done" and not it.get("completed"):
-                continue
-            if self.current_status == "today":
-                end = it.get("endtime") or ""
-                if today not in end:
-                    continue
-            if self.current_category != "all" and it.get("category") != self.current_category:
-                continue
-            if self.search_text:
-                blob = (it.get("text", "") + " " + " ".join(it.get("tags") or [])).lower()
-                if self.search_text not in blob:
-                    continue
-            result.append(it)
-        return result
-
-    def refresh_list(self):
-        # 清空旧卡片
-        while self.list_layout.count() > 0:
-            item = self.list_layout.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                w.setParent(None)
-                w.deleteLater()
-        # 重新填充
-        filtered = self._filtered_items()
-        if not filtered:
-            empty = QLabel(self._empty_text())
-            empty.setAlignment(Qt.AlignCenter)
-            empty.setWordWrap(True)
-            empty.setStyleSheet(
-                "color: #C8B27A; font-size: 12px; padding: 28px 8px; background: transparent;"
-            )
-            self.list_layout.addWidget(empty)
-        else:
-            for it in filtered:
-                card = TodoItemCard(it)
-                card.completed_changed.connect(self._on_card_completed)
-                card.delete_requested.connect(self._on_card_delete)
-                self.list_layout.addWidget(card)
-        self.list_layout.addStretch()
-        self._update_stats()
-
-    def _empty_text(self):
-        if self.search_text:
-            return "没有匹配的待办，换个关键词试试 🔍"
-        if self.current_status == "done":
-            return "目前还没有完成的待办，加油！💪"
-        if self.current_status == "today":
-            return "今天没有截止的待办，悠着点吧~ 🍵"
-        if self.current_status == "pending":
-            return "所有待办都完成啦！干得漂亮！🎉"
-        return "还没有待办事项哦~\n直接和有珠聊天，她会自动帮你记下来~ ✨"
-
-    def _update_stats(self):
-        items = self.store.all()
-        total = len(items)
-        done = sum(1 for it in items if it.get("completed"))
-        pending = total - done
-        # 概览大卡片
-        if total == 0:
-            self.overview_label.setText("📭 还没有待办，有需要直接告诉有珠吧~")
-        else:
-            ratio = int((done / total) * 100) if total else 0
-            self.overview_label.setText(
-                f"🌟 共 {total} 条 · 待完成 {pending} · 已完成 {done}  ({ratio}% 进度)"
-            )
-        self.stats_label.setText(
-            f"💪 当前显示 {len(self._filtered_items())} 条 ｜ 共 {total} 条 ｜ 已完成 {done}"
-        )
-
-    # ----- 卡片回调 -----
-    def _on_card_completed(self, todo_id, completed):
-        self.store.set_completed(todo_id, completed)
-        if completed and self.pet:
-            self.pet.set_happy()
-            self.pet.show_bubble("太棒了！完成一个！🎉", duration=3000)
-
-    def _on_card_delete(self, todo_id):
-        self.store.remove(todo_id)
-
-    def _on_todo_added_flash(self, _item):
-        # 简单视觉提示：滚动到底部
-        QTimer.singleShot(80, lambda: self.scroll_area.verticalScrollBar().setValue(
-            self.scroll_area.verticalScrollBar().maximum()
-        ))
-
-    # ----- 输入区 -> 添加 -----
-    def add_todo_from_input(self):
-        text = self.input_field.text().strip()
-        if not text:
-            return
-        priority = self.priority_combo.currentData() or "medium"
-        ok, item = self.store.add(
-            {"text": text, "priority": priority, "category": "other", "source": "user"},
-            dedup=True,
-        )
-        self.input_field.clear()
-        if not ok and item is not None:
-            # 命中已有的同义条目
-            self.stats_label.setText(f"⚠️ 已有相似待办：「{item['text']}」")
-            if self.pet:
-                self.pet.show_bubble(f"诶, 已经记过这条啦~", duration=3000)
-            return
-        if self.pet and ok:
-            self.pet.set_happy()
-            self.pet.show_bubble("收到！加油完成它！✨", duration=3000)
-
-    # ----- 作业同步 -----
-    def sync_homework(self):
-        self.sync_btn.setText("获取中...")
-        self.sync_btn.setEnabled(False)
-        self.fetcher_thread = HomeworkFetcherThread()
-        self.fetcher_thread.finished_signal.connect(self.on_homework_fetched)
-        self.fetcher_thread.error_signal.connect(self.on_homework_error)
-        self.fetcher_thread.start()
-
-    def on_homework_fetched(self, homeworks):
-        self.sync_btn.setText("🔄 获取作业")
-        self.sync_btn.setEnabled(True)
-        added = 0
-        for hw in homeworks:
-            ok, _ = self.store.add(hw, dedup=True)
-            if ok:
-                added += 1
-        if self.pet:
-            if added > 0:
-                self.pet.set_happy()
-                self.pet.show_bubble(f"获取成功！新增了 {added} 个作业任务！📚")
-            else:
-                self.pet.show_bubble("获取成功！没有新的作业哦~ 🎉")
-
-    def on_homework_error(self, error_msg):
-        self.sync_btn.setText("🔄 获取作业")
-        self.sync_btn.setEnabled(True)
-        if self.pet:
-            self.pet.show_bubble(f"获取失败：{error_msg} 😢")
-
-    # ----- 拖拽：仅在 header 区域生效，避免和列表冲突 -----
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            if hasattr(self, "header") and self.header.geometry().contains(event.pos() - QPoint(10, 10)):
-                self._drag_anchor = event.pos()
-                self.drag_offset = event.pos()
-            else:
-                self._drag_anchor = None
-
-    def mouseMoveEvent(self, event):
-        if event.buttons() == Qt.LeftButton and self._drag_anchor is not None:
-            self.move(self.mapToGlobal(event.pos() - self.drag_offset))
-
-    def mouseReleaseEvent(self, event):
-        self._drag_anchor = None
 
 
 if __name__ == "__main__":
