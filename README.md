@@ -1,154 +1,176 @@
-# 久远寺有珠桌宠 —— 带记忆与灵魂的桌面伙伴
+[README.md](https://github.com/user-attachments/files/28863794/README.md)
+# 久远寺有珠桌宠 2.0 —— 带记忆与灵魂的桌面伙伴
 
-一个基于 PyQt5 的桌面宠物程序，拥有长期记忆系统、向量检索知识库、语音合成、待办清单等丰富功能。与《魔法使之夜》的久远寺有珠对话，她会记住你的喜好，随时间成长。
+<p align="center">
+  <img src="./有珠.gif" width="180" alt="有珠桌宠动画">
+  <img src="./猫猫有珠.gif" width="180" alt="猫猫有珠动画">
+</p>
 
+<p align="center">
+  <img alt="Python" src="https://img.shields.io/badge/Python-3.10+-6FA8DC?style=for-the-badge&logo=python&logoColor=white">
+  <img alt="PyQt5" src="https://img.shields.io/badge/PyQt5-Desktop-8EA8C3?style=for-the-badge">
+  <img alt="LangChain" src="https://img.shields.io/badge/LangChain-Agent-3D2B56?style=for-the-badge">
+  <img alt="Version" src="https://img.shields.io/badge/Version-2.0-1A1A1A?style=for-the-badge">
+</p>
+
+一个基于 PyQt5 的本地桌面宠物程序，拥有记忆系统、向量检索知识库、语音合成、情感表情包、待办清单、主动关怀和定时提醒等功能。
+
+你可以把她当作一个一直挂在桌面上的陪伴式 Agent：她会记住你经常提到的事，理解你最近在忙什么，在合适的时候提醒你休息，也可以帮你整理待办、检索文档、读出回复。
+
+仓库地址：[moonriver05/Deskpet-langchain-](https://github.com/moonriver05/Deskpet-langchain-)
 
 ## 目录
 
 - [功能特点](#-功能特点)
+- [2.0 更新亮点](#-20-更新亮点)
 - [安装与依赖](#-安装与依赖)
 - [首次使用配置](#-首次使用配置)
-- [配置说明](#-配置说明)
 - [使用指南](#-使用指南)
+- [表情包同步](#-表情包同步)
 - [项目结构](#-项目结构)
 - [第三方依赖与致谢](#-第三方依赖与致谢)
+- [常见问题](#-常见问题)
 - [许可证](#-许可证)
-
 
 ## ✨ 功能特点
 
-### 🧠 长期记忆系统
+### 🧠 记忆系统
 
-- **语义检索优先**：基于 Chroma 向量数据库，确保召回的记忆与当前对话真正相关
-- **艾宾浩斯遗忘机制**：记忆会随时间衰减，重要记忆被强化，过时记忆被遗忘
-- **灵魂状态系统**：4 维能量槽动态调整 AI 行为——回忆深度、印象深度、表达欲望、创造力
-- **记忆去重**：向量相似度 + 字面双重去重，避免重复存储
+- **短期记忆**：保存近期对话中值得回忆的信息，并参与当前聊天检索。
+- **长期记忆**：短期记忆达到一定重要度后迁移为长期记忆，作为后续用户画像和训练数据来源。
+- **用户画像**：长期记忆不会直接堆进 prompt，而是被提炼成更紧凑的画像，例如学习习惯、身体情况、互动偏好。
+- **混合检索**：结合 Chroma 向量召回、中文词面召回、最近上下文和本地融合打分，减少“明明不相关却被拉出来”的情况。
+- **DeepSeek 重排**：可选用 DeepSeek 对候选记忆做小请求重排，失败时自动退回本地分数。
 
 ### 📚 知识库系统
 
-- **多格式支持**：`.txt`、`.md`、`.pdf`、`.docx`
-- **Markdown 智能切分**：保留章节结构，自动拆分为带上下文的语义块
-- **Sentence-Window 扩展**：命中某个 chunk 后自动拉取相邻 chunk，保持上下文连贯
+- **多格式支持**：`.txt`、`.md`、`.pdf`、`.docx`。
+- **Markdown 智能切分**：尽量保留标题和章节结构，自动拆分为带上下文的语义块。
+- **相邻片段扩展**：命中文档片段后，会拉取附近内容，避免只给模型一小段断裂文本。
 
 ### 💬 智能对话
 
-- **火山方舟 LLM 驱动**：兼容 OpenAI API 格式，可选 `doubao-1-5-pro` / `doubao-seed-2-0-mini` 等模型
-- **短期对话记忆**：保留最近 10 轮对话上下文，避免反复问同一件事
-- **情感表情包**：AI 自动判断情感并回复对应的表情包图片（需配置腾讯云 COS 图床）
+- **火山方舟 LLM 驱动**：兼容 OpenAI API 格式，可接入豆包等模型。
+- **短期上下文**：保留最近对话，让有珠知道刚刚聊过什么。
+- **现实边界**：角色设定和本地能力分开，尽量避免她说出“让小使魔碰你手背”这类现实中做不到的动作。
+- **反馈按钮**：回复支持点赞/点踩，后续可以作为偏好模型或回复重排的数据。
+
+### 🖼️ 情感表情包
+
+- **情绪匹配**：根据回复情绪选择合适的表情包。
+- **本地图集**：可以把表情包按情绪放在 `memes/` 目录下。
+- **COS 图床**：配置腾讯云 COS 后，可以同步表情包并在聊天气泡里显示。
 
 ### 🔊 语音合成
 
-- **GPT-SoVITS 接入**：回复自动合成语音，气泡旁带 🔊 按钮可播放/重试
-- **多音色支持**：可配置参考音频和微调权重，切换不同说话人音色
+- **GPT-SoVITS 接入**：回复可以自动合成语音。
+- **一键播放**：聊天气泡旁有播放按钮，可播放或重试。
+- **音色配置**：可以指定参考音频和权重，让声音更贴合角色。
 
 ### ✅ 待办清单
 
-- **AI 自动写入**：聊天时大模型智能判断是否需要记待办，自动写入清单
-- **卡片化 UI**：优先级颜色标识、分类徽标、标签芯片、截止时间
-- **优学院作业同步**：一键拉取未完成的在线作业，自动转为待办事项
-- **A2UI 协议支持**：遵循 v0.9 规范，支持通过 UI 消息更新清单
+- **手动管理**：支持添加、编辑、删除、完成待办。
+- **聊天写入**：当你明确说“帮我记一下”“提醒我”时，可以自动写入待办。
+- **作业同步**：支持同步未完成作业并转成待办事项。
+- **筛选搜索**：支持按状态、分类和关键词快速查找。
+
+### ⏱️ 定时提醒
+
+- **喝水提醒**：本地定时触发，不需要消耗大模型 token。
+- **久坐提醒**：长时间运行时自动提醒你站起来动一动。
+- **专注倒计时**：可以启动专注/倒计时窗口。
+- **主动关怀**：和普通定时提醒分开，根据最近上下文生成更像陪伴的消息。
 
 ### 🎨 桌面宠物
 
-- **GIF 动画支持**：读取本地 `有珠.gif` 作为宠物动画
-- **节日问候**：自动识别公历/农历节日并送上祝福
-- **定时提醒**：久坐提醒、喝水提醒、随机闲聊
-- **拖拽移动**：按住左键即可拖动
+- **GIF 动画支持**：默认读取 `有珠.gif` 作为桌宠动画。
+- **右键菜单**：打开聊天、待办、记忆管理、设置等窗口。
+- **拖拽移动**：按住左键即可拖动。
+- **暗色魔女风 UI**：部分窗口已调整为黑、雾霾蓝、暗紫的极简暗色主题。
 
+## 🌙 2.0 更新亮点
+
+- 从单文件逐步拆成模块，当前已拆出 `pet_core/`、`pet_memory/`、`pet_services/`、`pet_features/`。
+- 短期记忆、长期记忆、用户画像分层，不再把所有记忆粗暴塞进 prompt。
+- 记忆检索加入最近上下文、中文词面召回、2/3-gram、MySQL LIKE、本地融合分数和 DeepSeek 重排。
+- 画像精炼加入 evidence/claim 结构，减少重复画像和旧证据残留。
+- Chroma 写入/删除失败时进入同步队列，后续自动修复。
+- 增加本地能力注册表，让模型更清楚有珠能做什么、不能做什么。
+- 待办系统独立成模块，后续更方便维护。
+- 增加点赞/点踩反馈，为后续个性化模型训练做准备。
 
 ## 📦 安装与依赖
 
 ### 环境要求
 
+- Windows
 - Python 3.10+
-- MySQL 5.7 / 8.0（用于长期记忆存储）
-- Docker（用于 Chroma 向量数据库）
+- MySQL 5.7 / 8.0
+- Docker
+- Chroma MCP 容器
+
+可选：
+
+- GPT-SoVITS：用于语音合成
+- 腾讯云 COS：用于表情包图床
 
 ### 安装 Python 依赖
 
 ```bash
-pip install PyQt5 pymysql langchain-openai zhdate requests python-dotenv
-pip install PyMuPDF python-docx jieba      # 可选，知识库文件解析
-pip install qcloud-cos                     # 可选，图床支持
-# 语音合成相关：可跳过，不影响基础聊天功能
+pip install PyQt5 pymysql requests langchain-openai langchain-core openai zhdate jieba
+pip install PyMuPDF python-docx qcloud-cos
 ```
 
 ### Docker 启动 Chroma
 
 ```bash
-docker run -d --name chroma-mcp --restart unless-stopped \
-  -v pet_desktop_chroma:/chroma_data --entrypoint sleep mcp/chroma infinity
+docker run -d --name chroma-mcp --restart unless-stopped ^
+  -v chroma_pet_data:/chroma_data ^
+  --entrypoint sleep mcp/chroma infinity
 ```
 
-### GPT-SoVITS（语音合成，可选）
+程序会复用这个容器：
 
-1. 将 `GPT-SoVITS-v2pro-20250604` 放入 `voice/` 目录
-2. 启动语音 API 服务：
+```bash
+docker exec -i chroma-mcp chroma-mcp --client-type persistent --data-dir /chroma_data
+```
+
+### GPT-SoVITS（可选）
+
+将 GPT-SoVITS 工程放入 `voice/` 目录后，启动对应 API 服务，例如：
 
 ```bash
 cd voice/GPT-SoVITS-v2pro-20250604
 runtime\python.exe api_v2.py -a 127.0.0.1 -p 9880 -c GPT_SoVITS\configs\tts_infer.yaml
 ```
 
-
 ## ⚙️ 首次使用配置
 
-桌宠启动时，会自动弹出**设置窗口**，你需要填写以下必填项：
+桌宠第一次启动时会弹出设置窗口。常用配置如下：
 
-| 配置项           | 获取方式                                                     |
-| ---------------- | ------------------------------------------------------------ |
-| MySQL 密码       | 你安装 MySQL 时设置的密码                                    |
-| 火山方舟 API Key | 访问 [火山方舟控制台](https://www.volcengine.com/product/ark) 申请，格式 `ark-xxxxxx` |
+| 配置项 | 说明 |
+| --- | --- |
+| MySQL | 存储短期记忆、长期记忆、画像、待办等数据 |
+| 火山方舟 API Key | 主聊天模型 |
+| DeepSeek API Key | 可选，用于画像精炼和记忆重排 |
+| Chroma 容器名 | 默认 `chroma-mcp` |
+| 腾讯云 COS | 可选，用于表情包图床 |
+| GPT-SoVITS | 可选，用于语音合成 |
+| 优学院账号 | 可选，用于同步作业待办 |
 
-配置保存后会自动写入 `pet_config.json`。
-
-### 可选配置
-
-| 模块               | 说明                                                         |
-| ------------------ | ------------------------------------------------------------ |
-| **腾讯云 COS**     | 表情包图床。需填写 SecretId、SecretKey、Bucket、地域、公网域名。留空则回复不带表情包 |
-| **GPT-SoVITS**     | 语音合成。需指定参考音频路径、GPT/SoVITS 权重路径            |
-| **优学院作业拉取** | 自动同步未完成作业到待办清单。需填写账号、密码及相应 API 地址 |
-| **Chroma 容器名**  | 默认 `chroma-mcp`，一般无需修改                              |
-
-
-## ⚙️ 配置说明
-
-所有敏感配置（API Key、密码等）均存储在 `pet_config.json` 中，不会出现在代码里。
-
-### 配置结构示例
-
-```json
-{
-  "mysql": {
-    "host": "localhost",
-    "port": 3306,
-    "user": "root",
-    "password": "",
-    "database": "pet_memory_db"
-  },
-  "ark": {
-    "api_key": "ark-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-xxxxxx",
-    "base_url": "https://ark.cn-beijing.volces.com/api/v3",
-    "model_main": "doubao-1-5-pro-32k-250115",
-    "model_extractor": "doubao-seed-2-0-mini-260428",
-    "model_tool": "doubao-seed-2-0-mini-260428"
-  }
-}
-```
-
-### 环境变量（可选）
-
-支持以下环境变量覆盖配置：
-
-- `CHROMA_MCP_CONTAINER`：Chroma 容器名
-- `PET_TTS_API`：GPT-SoVITS API 地址
-- 其他配置建议通过设置窗口填写，会自动写入 `pet_config.json`
-
+配置保存后会写入本地 `pet_config.json`。
 
 ## 🚀 使用指南
 
 ### 启动桌宠
+
+Windows 下可以双击：
+
+```text
+启动桌宠.bat
+```
+
+也可以手动运行：
 
 ```bash
 python pet.py
@@ -156,92 +178,135 @@ python pet.py
 
 ### 交互方式
 
-| 操作         | 功能                                                 |
-| ------------ | ---------------------------------------------------- |
-| **左键拖拽** | 移动桌宠                                             |
-| **右键单击** | 打开功能菜单：聊天、待办清单、添加知识库、设置、退出 |
-| **双击左键** | 快捷打开待办清单                                     |
+| 操作 | 功能 |
+| --- | --- |
+| 左键拖拽 | 移动桌宠 |
+| 右键单击 | 打开功能菜单 |
+| 聊天窗口 | 对话、发送图片、播放语音、点赞/点踩 |
+| 待办窗口 | 管理待办、同步作业 |
+| 记忆管理 | 查看和编辑短期记忆、长期记忆、用户画像 |
+| 设置窗口 | 配置模型、数据库、TTS、COS 等 |
 
 ### 聊天功能
 
-1. 右键 → **💬 聊天** 打开聊天窗口
-2. 输入文字或拖拽文件/图片发送
-3. AI 会自动：
-   - 提取关键词检索记忆
-   - 判断是否需要存入新记忆
-   - 识别情感并回复表情包（如已配置图床）
-4. 语音合成：AI 回复后气泡旁会出现 🔊 按钮，点击播放语音
+1. 右键打开聊天窗口。
+2. 输入文字或发送图片。
+3. 有珠会结合角色设定、当前输入、用户画像、相关短期记忆、知识库和最近上下文回复。
+4. 如果配置了 TTS，可以点击气泡旁的播放按钮听语音。
+5. 可以给回复点赞/点踩，作为后续个性化训练数据。
 
 ### 待办清单
 
-- **手动添加**：在待办窗口底部输入框填写，选择优先级
-- **AI 自动写入**：聊天时说“记得提醒我...”，AI 会自动写入清单
-- **作业同步**：点击顶部 **🔄 获取作业** 自动拉取优学院未完成作业
-- **筛选**：支持按状态（全部/未完成/已完成/今日）、分类、关键词搜索
+- 手动添加、编辑、删除待办。
+- 聊天时明确要求记录事项，可以自动写入待办。
+- 支持作业同步。
+- 支持搜索和筛选。
 
-### 知识库
+### 记忆管理
 
-- 右键 → **📚 添加知识库**，选择文档（.pdf/.docx/.txt/.md）
-- 文档会自动切分并向量化，后续对话中可以检索相关段落
+- 可以查看短期记忆、长期记忆、用户画像。
+- 可以手动添加、编辑、删除记忆。
+- 修改短期记忆时会同步到 Chroma。
+- 修改长期记忆后会重新精炼画像，避免旧画像残留。
 
-### 表情包同步（可选）
+## 🖼️ 表情包同步
 
-- 在 `memes/` 目录下按情感英文名创建子文件夹，放入图片
-- 聊天窗口点击 **☁️** 按钮同步到腾讯云 COS 图床
-- 之后 AI 回复时会自动匹配情感并显示对应表情包
+如果你配置了腾讯云 COS，可以把表情包按情绪放入 `memes/` 目录：
 
+```text
+memes/
+├── happy/
+├── sad/
+├── angry/
+├── tired/
+├── surprised/
+└── neutral/
+```
+
+然后在聊天窗口中点击同步按钮，把本地表情包同步到图床。有珠回复时会根据情绪选择合适的图片。
+
+推荐按英文情绪名分类，方便模型和程序匹配。没有配置 COS 时，聊天功能仍然可用，只是不会显示远程表情包。
 
 ## 📁 项目结构
 
-```
+```text
 .
 ├── pet.py                    # 主程序入口
-├── pet_config.json           # 配置文件（自动生成，不要提交）
-├── conversation_history.json # 短期对话历史
-├── todo_data.json           # 待办清单数据
-├── tts_cache/               # 语音缓存（退出时自动清理）
-├── memes/                   # 本地表情包目录（按情感分类）
-│   ├── happy/
-│   ├── sad/
-│   └── ...
-├── voice/                   # GPT-SoVITS 工程目录
-│   └── GPT-SoVITS-v2pro-20250604/
-└── 有珠.gif                 # 宠物动画（可替换）
+├── 启动桌宠.bat              # Windows 双击启动
+├── pet_core/                 # 配置、角色设定、上下文、主动关怀、计时解析
+├── pet_memory/               # 记忆、画像、检索、Chroma 同步、数据库初始化
+├── pet_services/             # Chroma、知识库、TTS 等服务封装
+├── pet_features/             # 待办系统等功能模块
+├── pet_config.json           # 本地配置文件
+├── conversation_history.json # 最近对话上下文
+├── todo_data.json            # 待办数据
+├── feedback_data.jsonl       # 点赞/点踩反馈
+├── memes/                    # 本地表情包目录
+├── voice/                    # GPT-SoVITS 工程目录
+├── tts_cache/                # 语音缓存
+├── 有珠.png                  # 桌宠静态图
+├── 有珠.gif                  # 桌宠动画
+└── 猫猫有珠.gif              # 备用动画
 ```
 
 ### 数据存储说明
 
-| 数据类型 | 存储位置                    | 说明                     |
-| -------- | --------------------------- | ------------------------ |
-| 长期记忆 | MySQL + Chroma              | 用户画像、偏好、重要事实 |
-| 短期对话 | `conversation_history.json` | 最近 10 轮对话           |
-| 知识库   | Chroma（KB collection）     | 上传的文档切片           |
-| 待办清单 | `todo_data.json`            | 未完成/已完成待办        |
-
+| 数据类型 | 存储位置 | 说明 |
+| --- | --- | --- |
+| 短期记忆 | MySQL + Chroma | 当前聊天检索使用 |
+| 长期记忆 | MySQL | 用户画像和后续训练数据来源 |
+| 用户画像 | MySQL | 进入 prompt 的长期个性化摘要 |
+| 知识库 | Chroma | 上传文档切片 |
+| 最近对话 | `conversation_history.json` | 近期上下文 |
+| 待办清单 | `todo_data.json` | 本地待办 |
+| 反馈数据 | `feedback_data.jsonl` | 点赞/点踩 |
 
 ## 🙏 第三方依赖与致谢
 
 本项目在开发中参考了以下优秀项目：
 
-- **[astrbot_plugin_meme_manager](https://github.com/anka-afk/astrbot_plugin_meme_manager)** —— AstrBot 表情包管理插件，参考了其功能组织与 README 风格
-- **[astrbot_plugin_angel_memory](https://github.com/kawayiYokami/astrbot_plugin_angel_memory)** —— 记忆系统设计思路，特别是灵魂状态能量槽与三层认知架构
-- **[GPT-SoVITS](https://github.com/RVC-Boss/GPT-SoVITS)** —— 强大的少样本语音合成引擎，用于实现桌宠语音回复
+- [astrbot_plugin_meme_manager](https://github.com/anka-afk/astrbot_plugin_meme_manager)：表情包管理思路。
+- [astrbot_plugin_angel_memory](https://github.com/kawayiYokami/astrbot_plugin_angel_memory)：记忆系统设计启发。
+- [Shinsekai](https://github.com/RachelForster/Shinsekai)：陪伴式 Agent 的交互体验参考。
+- [GPT-SoVITS](https://github.com/RVC-Boss/GPT-SoVITS)：少样本语音合成。
 
 核心技术栈：
 
-- **PyQt5** —— 跨平台 GUI 框架
-- **LangChain** —— LLM 调用封装
-- **Chroma** + **MCP** —— 向量数据库与检索
-- **火山方舟** —— LLM 推理服务（OpenAI 兼容）
-- **腾讯云 COS** —— 表情包图床
-- **pymysql** —— MySQL 数据库连接
+- PyQt5
+- LangChain
+- Chroma + MCP
+- MySQL
+- 火山方舟 / DeepSeek
+- 腾讯云 COS
+- GPT-SoVITS
 
+## ❓ 常见问题
+
+### 启动时数据库连接失败？
+
+检查 MySQL 是否已启动，以及设置窗口里的 host、port、user、password 是否正确。
+
+### 记忆检索为空？
+
+第一次使用时记忆为空是正常的。确认 Chroma 容器正在运行，并且聊天中已经产生可存储的记忆。
+
+### 回复没有表情包？
+
+需要配置腾讯云 COS 并同步表情包。没有配置时仍然可以正常聊天。
+
+### 回复没有声音？
+
+需要单独启动 GPT-SoVITS API，并在设置窗口中填写 TTS 地址、参考音频和权重。
+
+### 主动关怀为什么没有在电脑关机后继续？
+
+这是本地桌宠程序，需要电脑和程序保持运行。没有运行时不会在后台执行主动关怀或定时提醒。
 
 ## 📄 许可证
 
 本项目基于 **Apache License 2.0** 开源。
 
-```
+```text
 Copyright 2026 pet_desktop
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -257,39 +322,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-
-## ⚠️ 注意事项
-
-1. **第一次启动会弹出设置窗口**，请务必填写 MySQL 密码和火山方舟 API Key
-2. `pet_config.json` 包含 API 密钥和数据库密码，**请勿提交到 GitHub**
-3. 建议将 `pet_config.json` 加入 `.gitignore`
-4. Chroma 容器需提前运行，否则记忆检索不可用
-5. GPT-SoVITS 语音合成需单独启动 API 服务，不影响基础聊天
-6. 腾讯云 COS 配置缺失时，AI 回复仍正常，只是不带表情包图片
-
-
-## ❓ 常见问题
-
-**Q：启动时提示数据库连接失败？**  
-A：检查 MySQL 是否已启动，以及在设置窗口中填写的密码是否正确。
-
-**Q：AI 回复很慢或没反应？**  
-A：检查火山方舟 API Key 是否正确填写，以及网络是否可达。
-
-**Q：记忆好像不太相关？**  
-A：长期记忆采用语义相似度主导的检索，第一次对话时记忆库为空是正常的。随着对话增加，记忆会逐渐积累。
-
-**Q：想改宠物动画？**  
-A：直接替换同目录下的 `有珠.gif` 即可，程序会自动识别并播放。
-
-**Q：本地运行正常但打包成 exe 后报错？**  
-A：检查 PyQt5 的 `Qt5/plugins` 路径是否正确；确保 `pet_config.json` 在可执行文件同目录下。
-
-
-## 🗣️ 问题反馈
-
-欢迎提交 [Issues](https://github.com/yourusername/pet_desktop/issues) 或 Pull Request。
-
 ---
 
-**开发不易，如果这个项目对你有帮助，欢迎给个 Star ⭐**
+如果这个项目对你有帮助，欢迎给个 Star，也欢迎提交 Issue 记录 bug、建议和新的想法。
