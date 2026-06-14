@@ -101,7 +101,7 @@ except ImportError:
     pass
 
 
-# ==================== ???? (AppConfig) ====================
+# ====================  (AppConfig) ====================
 def apply_config_to_globals():
     """把 app_config 的值同步到老的模块级全局变量（DB_CONFIG / COS_CONFIG / ark_api_key 等）。
     设置窗口保存后会再调一次，使新值即时生效（不用重启）。
@@ -1615,6 +1615,7 @@ class DesktopPet(QWidget):
         self.proactive_today = datetime.date.today()
         self.proactive_count_today = 0
         self.pending_proactive_messages = []
+        self.awaiting_proactive_reply = False
         self.focus_timer_end_at = None
         self.focus_timer_label = "专注"
         self.focus_timer_total_seconds = 0
@@ -1867,6 +1868,7 @@ class DesktopPet(QWidget):
 
     def observe_user_message(self, text):
         self.last_user_interaction_at = datetime.datetime.now()
+        self.awaiting_proactive_reply = False
         QTimer.singleShot(1000 * 60 * 12, self.proactive_companion_tick)
 
     def proactive_companion_tick(self):
@@ -1879,6 +1881,8 @@ class DesktopPet(QWidget):
             self.proactive_today = now.date()
             self.proactive_count_today = 0
         if self.proactive_count_today >= 10:
+            return
+        if self.awaiting_proactive_reply or self.pending_proactive_messages:
             return
         if self.last_proactive_at and (now - self.last_proactive_at).total_seconds() < 45 * 60:
             return
@@ -1943,6 +1947,7 @@ class DesktopPet(QWidget):
             return
         self.last_proactive_at = datetime.datetime.now()
         self.proactive_count_today += 1
+        self.awaiting_proactive_reply = True
         try:
             conversation_history.add_turn("", text)
         except Exception as e:
@@ -2239,6 +2244,7 @@ class DesktopPet(QWidget):
 
     def open_chat(self):
         if self.chat_window is None or not self.chat_window.isVisible():
+            had_pending_proactive = bool(self.pending_proactive_messages)
             self.chat_window = ChatWindow(self)
             
             # 让聊天窗口居中显示
@@ -2250,7 +2256,8 @@ class DesktopPet(QWidget):
             
             self.chat_window.show()
             self.flush_pending_proactive_messages()
-            self.show_bubble("来聊天吧！", duration=3000)
+            if not had_pending_proactive:
+                self.show_bubble("来聊天吧！", duration=3000)
         else:
             self.chat_window.activateWindow()
             self.flush_pending_proactive_messages()
@@ -2428,7 +2435,12 @@ class LLMFetcherThread(QThread):
 
         persist_executor = None
         mem_write_future = None
-
+        now = datetime.datetime.now()
+        year=now.year
+        month=now.month
+        day=now.day
+        hour=now.hour
+        minute=now.minute
         try:
             api_key = app_config.get("ark.api_key", "") or ""
             base_url = app_config.get("ark.base_url", "") or "https://ark.cn-beijing.volces.com/api/v3"
@@ -2447,10 +2459,12 @@ class LLMFetcherThread(QThread):
                 }
             )
 
-            extractor_prompt = f"""请分析以下用户输入。
+            extractor_prompt = f"""当前时间是{year}年{month}月{day}日{hour}时{minute}分，请分析以下用户输入。
 1. 提取出能概括这句话的 1 到 3 个核心关键词（用逗号分隔，方便用作数据库检索）。
 2. 判断这句话是否包含用户的个人喜好、习惯或某些重要事实。如果有，请提取为一句简短的描述；如果没有，请仅填"无"。
 3. 同时用户询问对象如果是和桌宠有关的东西，指向的主体都是久远寺有珠，所以数据库保存的询问主体应该是"久远寺有珠"。
+4. 如果是“无”的话，那就把用户的话简写作为记忆内容。
+5. 如果用户说了带时间的东西，比方说“我上午干了xxx”，变成比方说“2026年x月x日上午，用户干了xxx”。这种形式。
 请严格按以下格式输出，不要有任何多余的废话：
 关键词：xxx,yyy
 新记忆：事实描述或"无"
@@ -3050,8 +3064,9 @@ class ChatWindow(QWidget):
         input_area_layout.addWidget(input_shell)
         layout.addWidget(input_area)
         
-        # 初始问候语
-        QTimer.singleShot(200, lambda: self.add_message("没什么事请不要找我。", is_user=False))
+        # 初始问候语。若这次打开窗口是为了查看主动陪伴消息，就不再额外插入默认开场。
+        if not (self.pet and getattr(self.pet, "pending_proactive_messages", None)):
+            QTimer.singleShot(200, lambda: self.add_message("没什么事请不要找我。", is_user=False))
 
     def showEvent(self, event):
         super().showEvent(event)
