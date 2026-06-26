@@ -25,6 +25,8 @@
 - [安装与依赖](#-安装与依赖)
 - [首次使用配置](#-首次使用配置)
 - [使用指南](#-使用指南)
+- [Skill / Tool 能力注册](#-skill--tool-能力注册)
+- [RSS 内容推荐](#-rss-内容推荐)
 - [表情包同步](#-表情包同步)
 - [项目结构](#-项目结构)
 - [第三方依赖与致谢](#-第三方依赖与致谢)
@@ -53,6 +55,21 @@
 - **短期上下文**：保留最近对话，让有珠知道刚刚聊过什么。
 - **现实边界**：角色设定和本地能力分开，尽量避免她说出“让小使魔碰你手背”这类现实中做不到的动作。
 - **反馈按钮**：回复支持点赞/点踩，后续可以作为偏好模型或回复重排的数据。
+
+### 🧩 Skill / Tool 能力注册
+
+- **标准化能力表**：本地能力统一写在 `pet_core/skill_registry.py`，包含能力名、参数结构、风险等级、是否允许主动调用和现实边界。
+- **兼容常见工具格式**：可以导出 MCP tools、OpenAI function tools、项目 manifest 和 Markdown skill 文档。
+- **多轮承接**：当有珠上一句问“要不要帮你记成待办”，你下一句只说“好”，程序也会回到上一句内容执行。
+- **执行反馈**：工具待确认、执行成功、拒绝、失败都会写入学习反馈，方便后续训练本地策略模型。
+
+### 📰 RSS 内容推荐
+
+- **RSS 管理窗口**：可以手动添加标准 RSS/Atom 链接，也可以添加 RSSHub 路由，例如 B 站、Pixiv、GitHub、知乎、Arxiv、HuggingFace 等来源。
+- **只保存轻量信息**：本地缓存标题、摘要、封面、发布时间和原链接，不在聊天窗口内播放视频或内嵌网页。
+- **原链接跳转**：推荐内容会给出原网站链接，点击后用浏览器打开，并记录点击作为隐式反馈。
+- **推荐解释**：先用本地分数筛候选，再可选交给便宜 LLM 看标题/简介/缓存内容，生成“为什么推荐给你”的说明。
+- **本地 RSSHub**：可用 Docker 启动本地 RSSHub，减少公共镜像 503；B 站、Pixiv 等风控源可能需要在设置里填 Cookie/Token。
 
 ### 🖼️ 情感表情包
 
@@ -112,17 +129,19 @@
 - MySQL 5.7 / 8.0
 - Docker
 - Chroma MCP 容器
+- RSSHub 本地 Docker 容器（可选，推荐开启 RSS 内容推荐时使用）
 
 可选：
 
 - GPT-SoVITS：用于语音合成
 - 腾讯云 COS：用于表情包图床
+- NumPy：用于本地 MLP 策略预测器训练/推理；没有安装时策略预测会自动降级
 
 ### 安装 Python 依赖
 
 ```bash
 pip install PyQt5 pymysql requests langchain-openai langchain-core openai zhdate jieba
-pip install PyMuPDF python-docx qcloud-cos
+pip install PyMuPDF python-docx qcloud-cos numpy
 ```
 
 ### Docker 启动 Chroma
@@ -138,6 +157,22 @@ docker run -d --name chroma-mcp --restart unless-stopped ^
 ```bash
 docker exec -i chroma-mcp chroma-mcp --client-type persistent --data-dir /chroma_data
 ```
+
+### Docker 启动本地 RSSHub（可选）
+
+如果你要用 RSS 推荐，建议在设置窗口启用“本地 RSSHub”。程序会尝试自动复用或启动 `rsshub` 容器。也可以手动启动：
+
+```bash
+docker run -d --name rsshub --restart unless-stopped -p 1200:1200 diygod/rsshub
+```
+
+之后 RSSHub 地址一般是：
+
+```text
+http://127.0.0.1:1200
+```
+
+Pixiv、B 站 UP 投稿/动态等源可能会被风控。需要时在设置窗口填写 `PIXIV_REFRESHTOKEN` 或 `Bilibili Cookie`。这些登录态只保存在本地 `pet_config.json`，不要提交到 GitHub。
 
 ### GPT-SoVITS（可选）
 
@@ -158,6 +193,10 @@ runtime\python.exe api_v2.py -a 127.0.0.1 -p 9880 -c GPT_SoVITS\configs\tts_infe
 | 火山方舟 API Key | 主聊天模型 |
 | DeepSeek API Key | 可选，用于画像精炼和记忆重排 |
 | Chroma 容器名 | 默认 `chroma-mcp` |
+| 本地 RSSHub | 可选，用于 RSS 推荐、B 站/Pixiv 等内容源抓取 |
+| RSS 推荐模型 | 可选，用于总结候选内容并说明推荐理由 |
+| 学习数据打标模型 | 可选，用于给偏好样本打弱标签 |
+| 推荐候选生成模型 | 可选，用于从画像/记忆里生成候选动作 |
 | 腾讯云 COS | 可选，用于表情包图床 |
 | GPT-SoVITS | 可选，用于语音合成 |
 | 优学院账号 | 可选，用于同步作业待办 |
@@ -189,7 +228,9 @@ python pet.py
 | 聊天窗口 | 对话、发送图片、播放语音、点赞/点踩 |
 | 待办窗口 | 管理待办、同步作业 |
 | 记忆管理 | 查看和编辑短期记忆、长期记忆、用户画像 |
-| 设置窗口 | 配置模型、数据库、TTS、COS 等 |
+| RSS 管理 | 添加 RSS 源、刷新内容、查看封面和原链接 |
+| 训练样本标注 | 查看样本、修正偏好分数和策略标签 |
+| 设置窗口 | 配置模型、数据库、RSSHub、TTS、COS 等 |
 
 ### 聊天功能
 
@@ -212,6 +253,53 @@ python pet.py
 - 可以手动添加、编辑、删除记忆。
 - 修改短期记忆时会同步到 Chroma。
 - 修改长期记忆后会重新精炼画像，避免旧画像残留。
+
+## 🧩 Skill / Tool 能力注册
+
+2.1 开始，项目把“角色设定”和“程序真实能力”分开。角色设定只决定有珠怎么说话，Skill / Tool 注册表决定她实际能做什么。
+
+核心文件：
+
+| 文件 | 作用 |
+| --- | --- |
+| `pet_core/skill_registry.py` | 标准 Skill 定义，记录能力名、参数、风险、边界和导出格式 |
+| `pet_core/tool_registry.py` | 旧能力注册表兼容层，避免旧 prompt/模块断掉 |
+| `pet_core/pending_intent.py` | 多轮工具承接，例如“要不要记待办？”之后用户只说“好” |
+| `pet_features/todo_system.py` | 当前待办/计时器工具路由使用的执行层 |
+
+可导出的格式：
+
+```bash
+python -m pet_core.skill_registry --format manifest
+python -m pet_core.skill_registry --format mcp
+python -m pet_core.skill_registry --format openai
+python -m pet_core.skill_registry --format markdown
+```
+
+目前注册的核心能力包括：聊天回复、添加待办、启动专注计时、RSS 外部内容推荐、打开原链接、读取粗粒度桌面状态。高风险或现实中做不到的能力不会写进注册表，有珠也不应该承诺这些事。
+
+## 📰 RSS 内容推荐
+
+RSS 推荐是 2.1 新增的独立内容管线，不和“推荐用户行为”的本地推荐器混在一起。
+
+使用方式：
+
+1. 右键桌宠打开 RSS 管理窗口。
+2. 添加标准 RSS/Atom 链接，或添加 RSSHub 路由。
+3. 点击刷新后，本地会缓存标题、摘要、封面、发布时间和原链接。
+4. 有珠需要推荐内容时，会从缓存中挑候选，再可选交给 LLM 总结内容和推荐理由。
+5. 点击原链接会用系统浏览器打开，并记录为隐式反馈。
+
+常见 RSSHub 示例：
+
+```text
+http://127.0.0.1:1200/bilibili/user/video/63231/noembed
+http://127.0.0.1:1200/bilibili/user/dynamic/63231
+http://127.0.0.1:1200/pixiv/ranking/day
+http://127.0.0.1:1200/pixiv/user/73152
+```
+
+如果公共 RSSHub 镜像返回 503，优先启用本地 RSSHub。B 站和 Pixiv 这类站点可能需要登录态；如果没有 Cookie/Token，程序会跳过这类源或给出明确错误，而不是卡住主线程。
 
 ## 🖼️ 表情包同步
 
@@ -237,14 +325,18 @@ memes/
 .
 ├── pet.py                    # 主程序入口
 ├── 启动桌宠.bat              # Windows 双击启动
-├── pet_core/                 # 配置、角色设定、上下文、主动关怀、计时解析
+├── pet_core/                 # 配置、角色设定、Skill 注册、RSS、主动关怀、策略预测
 ├── pet_memory/               # 记忆、画像、检索、Chroma 同步、数据库初始化
 ├── pet_services/             # Chroma、知识库、TTS 等服务封装
-├── pet_features/             # 待办系统等功能模块
+├── pet_features/             # 待办、RSS 管理、训练样本标注等功能窗口
+├── pet_core/skill_registry.py # 本地 Skill / Tool 能力注册表
+├── pet_core/rss_content.py   # RSS 源、缓存、内容推荐逻辑
+├── pet_core/strategy_predictor.py # 本地 MLP 策略预测器
 ├── pet_config.json           # 本地配置文件
 ├── conversation_history.json # 最近对话上下文
 ├── todo_data.json            # 待办数据
 ├── feedback_data.jsonl       # 点赞/点踩反馈
+├── learning_data/            # 训练样本、标签、RSS 缓存等本地数据
 ├── memes/                    # 本地表情包目录
 ├── voice/                    # GPT-SoVITS 工程目录
 ├── tts_cache/                # 语音缓存
@@ -261,6 +353,8 @@ memes/
 | 长期记忆 | MySQL | 用户画像和后续训练数据来源 |
 | 用户画像 | MySQL | 进入 prompt 的长期个性化摘要 |
 | 知识库 | Chroma | 上传文档切片 |
+| RSS 缓存 | `learning_data/rss_content/` | RSS 标题、摘要、封面、链接和推荐反馈 |
+| 学习样本 | `learning_data/` | 偏好预测、主动关怀、推荐器训练数据 |
 | 最近对话 | `conversation_history.json` | 近期上下文 |
 | 待办清单 | `todo_data.json` | 本地待办 |
 | 反馈数据 | `feedback_data.jsonl` | 点赞/点踩 |
