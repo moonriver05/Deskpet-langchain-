@@ -12,12 +12,11 @@ import requests
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from PyQt5.QtCore import QObject, QPoint, QThread, QTimer, Qt, pyqtSignal
-from PyQt5.QtGui import QColor, QFont
+from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFrame,
-    QGraphicsDropShadowEffect,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -30,6 +29,8 @@ from PyQt5.QtWidgets import (
 
 from pet_core.config import app_config
 from pet_core.persona import format_capability_registry_for_prompt
+from pet_core.skill_registry import export_router_tools
+from pet_core import window_chrome
 
 
 def has_explicit_todo_write_intent(text):
@@ -392,10 +393,11 @@ def todo_store():
 class TodoToolRouterThread(QThread):
     """独立的 LLM 工具路由线程：
     - 输入：用户最近一次输入 + 当前 todo 清单
-    - 输出：(added_items, skipped_items)，已经写入 TodoStore
+    - 输出：待办写入结果；计时器等其他工具通过独立 signal 交给主窗口执行
     """
 
     result_signal = pyqtSignal(list, list)
+    timer_signal = pyqtSignal(dict)
     error_signal = pyqtSignal(str)
 
     def __init__(self, user_text, store):
@@ -408,15 +410,8 @@ class TodoToolRouterThread(QThread):
             if not self.user_text:
                 self.result_signal.emit([], [])
                 return
-            if not has_explicit_todo_write_intent(self.user_text):
-                self.result_signal.emit([], [])
-                return
 
-            todo_tools = [
-                tool for tool in get_mcp_tool_definitions()
-                if tool.get("name") == "add_todo"
-            ]
-            tools_json = json.dumps(todo_tools, ensure_ascii=False, indent=2)
+            tools_json = json.dumps(export_router_tools(["todo.add", "timer.start"]), ensure_ascii=False, indent=2)
             existing = [
                 {"text": it["text"], "category": it.get("category", "")}
                 for it in self.store.items
@@ -425,7 +420,7 @@ class TodoToolRouterThread(QThread):
             existing_json = json.dumps(existing, ensure_ascii=False, indent=2)
             today_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
 
-            sys_prompt = f"""你是一个 MCP 风格的工具路由器，专门判断"用户的最新输入是否需要调用工具"，并按 A2UI v0.9 协议输出 UI 更新消息。
+            sys_prompt = f"""你是一个 MCP 风格的工具路由器，专门判断"用户的最新输入是否需要调用本地工具"。
 
 当前时间: {today_str}
 
@@ -438,24 +433,27 @@ class TodoToolRouterThread(QThread):
 【当前用户未完成的待办清单(用于去重判断)】:
 {existing_json}
 
-【A2UI v0.9 写入约定】:
+【A2UI v0.9 写入约定 - 仅 add_todo 使用】:
 - catalogId = "{A2UI_CATALOG_ID}"
 - surfaceId = "{A2UI_SURFACE_TODO}"
 - 每新增一条 todo, 对应一条 updateDataModel 消息, path 固定为 "/items/-", value 为一个 todo 对象。
+- start_focus_timer 不需要 a2ui_messages，只需要 tool_calls。
 
 【触发规则 - 必须严格遵守】:
 1. 仅当用户明确表达"帮我记下/加到待办/提醒我/我要在某时间做/安排一下/接下来要做"等执行意图时, 才输出 add_todo 调用。
-2. 愿望、祝愿、担心、泛泛目标、闲聊、问候、提问、感叹、回忆已经发生的事 → 不调用任何工具, 返回空列表。
-3. 像"希望考试能过/想变好/要加油/但愿顺利"这类没有具体行动的句子不是待办。可以让主回复鼓励用户, 但工具路由必须返回空列表。
-4. 用户描述的事项若与【当前未完成的待办清单】中**任意一条语义重复**(同义/包含关系/同一件事的不同说法), 不要再次添加。
-5. 一次最多 3 条。每条 text 控制在 30 个字以内, 不要复述用户原话, 提炼出待办主干。
-6. 如果用户提到"明天/后天/周一/下午三点"等相对时间, 请基于"当前时间"换算成绝对时间放入 due_date(格式 YYYY-MM-DD 或 YYYY-MM-DD HH:MM); 不确定就留空字符串。
+2. 仅当用户明确要求"启动/设置/帮我开"计时器, 且给出具体时长时, 才输出 start_focus_timer 调用。
+3. 用户只是提到工具名称、解释误触发、吐槽"别看到专注定时就直接定时了"、说"不是要你定时/不要定时/已经在计时了" → 不调用任何工具。
+4. 愿望、祝愿、担心、泛泛目标、闲聊、问候、提问、感叹、回忆已经发生的事 → 不调用任何工具, 返回空列表。
+5. 像"希望考试能过/想变好/要加油/但愿顺利"这类没有具体行动的句子不是待办。可以让主回复鼓励用户, 但工具路由必须返回空列表。
+6. 用户描述的事项若与【当前未完成的待办清单】中**任意一条语义重复**(同义/包含关系/同一件事的不同说法), 不要再次添加。
+7. add_todo 一次最多 3 条。每条 text 控制在 30 个字以内, 不要复述用户原话, 提炼出待办主干。
+8. 如果用户提到"明天/后天/周一/下午三点"等相对时间, 请基于"当前时间"换算成绝对时间放入 due_date(格式 YYYY-MM-DD 或 YYYY-MM-DD HH:MM); 不确定就留空字符串。
 
 【输出格式 - 必须是纯 JSON, 不要 markdown 围栏, 不要解释】:
-没有需要添加的待办时, 严格输出:
+没有需要调用工具时, 严格输出:
 {{"tool_calls": [], "a2ui_messages": []}}
 
-需要添加时(示例, 字段必须齐全):
+需要添加待办时(示例, 字段必须齐全):
 {{
   "tool_calls": [
     {{"name": "add_todo", "arguments": {{"text": "复习数据库 ER 图", "priority": "high", "category": "study", "due_date": "2026-05-15 22:00", "tags": ["期末"]}}}}
@@ -477,6 +475,14 @@ class TodoToolRouterThread(QThread):
       }}
     }}
   ]
+}}
+
+需要启动计时器时(示例):
+{{
+  "tool_calls": [
+    {{"name": "start_focus_timer", "arguments": {{"seconds": 1500, "label": "专注"}}}}
+  ],
+  "a2ui_messages": []
 }}"""
 
             tool_llm = ChatOpenAI(
@@ -485,6 +491,8 @@ class TodoToolRouterThread(QThread):
                 openai_api_base=app_config.get("ark.base_url", "") or "https://ark.cn-beijing.volces.com/api/v3",
                 max_tokens=600,
                 temperature=0.0,
+                timeout=20,
+                max_retries=0,
                 model_kwargs={"extra_body": {"thinking": {"type": "disabled"}}},
             )
             sys_message = SystemMessage(content=sys_prompt)
@@ -502,6 +510,7 @@ class TodoToolRouterThread(QThread):
 
             messages = parsed.get("a2ui_messages") or []
             tool_calls = parsed.get("tool_calls") or []
+            timer_request = None
 
             # 兜底：LLM 只给了 tool_calls 没给 a2ui_messages，本地补
             if not messages and tool_calls:
@@ -534,6 +543,30 @@ class TodoToolRouterThread(QThread):
                         },
                     })
 
+            for tc in tool_calls:
+                if not isinstance(tc, dict) or tc.get("name") != "start_focus_timer":
+                    continue
+                args = tc.get("arguments") or {}
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except Exception:
+                        args = {}
+                if not isinstance(args, dict):
+                    continue
+                try:
+                    seconds = int(float(args.get("seconds") or 0))
+                except Exception:
+                    seconds = 0
+                if seconds <= 0:
+                    continue
+                seconds = max(5, min(seconds, 24 * 60 * 60))
+                timer_request = {
+                    "seconds": seconds,
+                    "label": (args.get("label") or "专注").strip()[:8] or "专注",
+                }
+                break
+
             added_items = []
             for m in messages:
                 added_items.extend(self.store.apply_a2ui_message(m))
@@ -560,6 +593,8 @@ class TodoToolRouterThread(QThread):
                     if dup is not None:
                         skipped_items.append({"text": t, "reason": f"与已有「{dup['text']}」重复"})
 
+            if timer_request:
+                self.timer_signal.emit(timer_request)
             self.result_signal.emit(added_items, skipped_items)
         except Exception as e:
             import traceback
@@ -650,20 +685,20 @@ class TodoItemCard(QFrame):
     """
 
     PRIORITY_COLORS = {
-        "high":   "#9FB7CC",
-        "medium": "#6F879B",
-        "low":    "#46586B",
+        "high":   "#B886F8",
+        "medium": "#4E3C6B",
+        "low":    "#3D2E55",
     }
     CATEGORY_META = {
-        "work":     ("工作", "#9FB7CC"),
-        "study":    ("学习", "#B7A6D8"),
-        "life":     ("生活", "#A8AEB8"),
-        "homework": ("作业", "#C6D4E2"),
+        "work":     ("工作", "#B886F8"),
+        "study":    ("学习", "#A08CD2"),
+        "life":     ("生活", "#B8ADC9"),
+        "homework": ("作业", "#D1C8E1"),
         "other":    ("其他", "#8F9AAA"),
     }
     SOURCE_BADGE = {
-        "agent":    ("AI", "#9FB7CC"),
-        "homework": ("同步", "#B7A6D8"),
+        "agent":    ("AI", "#B886F8"),
+        "homework": ("同步", "#A08CD2"),
     }
 
     completed_changed = pyqtSignal(str, bool)
@@ -682,18 +717,18 @@ class TodoItemCard(QFrame):
         category = item.get("category", "other")
         is_hw = bool(item.get("is_homework"))
 
-        border_color = self.PRIORITY_COLORS.get(priority, "#6F879B")
-        bg = "#090A0D" if completed else "#050607"
+        border_color = self.PRIORITY_COLORS.get(priority, "#4E3C6B")
+        bg = "#1A1525" if completed else "#2A203B"
 
         self.setStyleSheet(f"""
             QFrame#todoCard {{
                 background-color: {bg};
                 border: 1px solid {border_color};
-                border-radius: 8px;
+                border-radius: 16px;
             }}
             QFrame#todoCard:hover {{
-                background-color: #0B1018;
-                border-color: #9FB7CC;
+                background-color: #3D2E55;
+                border-color: #B886F8;
             }}
         """)
 
@@ -708,13 +743,13 @@ class TodoItemCard(QFrame):
             QCheckBox {{ background: transparent; spacing: 0; }}
             QCheckBox::indicator {{
                 width: 18px; height: 18px;
-                border-radius: 9px;
-                border: 1px solid #9FB7CC;
-                background: #050607;
+                border-radius: 16px;
+                border: 1px solid #B886F8;
+                background: #1A1525;
             }}
             QCheckBox::indicator:checked {{
-                background-color: #34224A;
-                border-color: #B7A6D8;
+                background-color: #4E3C6B;
+                border-color: #A08CD2;
                 image: none;
             }}
         """)
@@ -731,7 +766,7 @@ class TodoItemCard(QFrame):
         text_layout.setContentsMargins(0, 0, 0, 0)
 
         # 标题
-        text_color = "#6F7783" if completed else "#F1EBDD"
+        text_color = "#6F7783" if completed else "#EAE5F2"
         self.title_label = QLabel(item.get("text", ""))
         self.title_label.setWordWrap(True)
         self.title_label.setStyleSheet(
@@ -771,7 +806,7 @@ class TodoItemCard(QFrame):
             details_label = QLabel("  ·  ".join(detail_parts))
             details_label.setWordWrap(True)
             details_label.setStyleSheet(
-                "color: #A8AEB8; font-size: 11px; background: transparent;"
+                "color: #B8ADC9; font-size: 11px; background: transparent;"
             )
             text_layout.addWidget(details_label)
 
@@ -785,14 +820,14 @@ class TodoItemCard(QFrame):
             QPushButton {
                 background: transparent;
                 border: 1px solid transparent;
-                border-radius: 13px;
+                border-radius: 16px;
                 font-size: 16px;
-                color: #6F879B;
+                color: #4E3C6B;
             }
             QPushButton:hover {
-                background-color: #20162E;
-                color: #F1EBDD;
-                border-color: #775E90;
+                background-color: #3D2E55;
+                color: #EAE5F2;
+                border-color: #B886F8;
             }
         """)
         self.del_btn.clicked.connect(lambda: self.delete_requested.emit(self.item["id"]))
@@ -809,7 +844,7 @@ class TodoItemCard(QFrame):
             f"background-color: #0B1018;"
             f"color: {color};"
             f"border: 1px solid {color}55;"
-            f"border-radius: 7px;"
+            f"border-radius: 16px;"
             f"padding: 1px 7px;"
             f"font-size: 10px;"
             f"font-weight: 500;"
@@ -851,6 +886,7 @@ class TodoWindow(QWidget):
         self.current_category = "all"
         self.search_text = ""
         self._connected = False
+        self.maximize_btn = None
         self.init_ui()
         self._connect_store()
         self.refresh_list()
@@ -883,26 +919,28 @@ class TodoWindow(QWidget):
     # ----- UI 构建 -----
     def init_ui(self):
         self.setWindowTitle("有珠的待办清单")
-        self.setFixedSize(400, 600)
-        self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
+        self.resize(400, 600)
+        self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint | Qt.WindowMinimizeButtonHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
+        window_chrome.setup_resizable_frameless_window(self, minimum_size=(340, 480))
 
-        # 外圆角容器 + 投影
+        # 外圆角容器。这里不使用 QGraphicsDropShadowEffect：
+        # Windows layered/transparent 窗口的投影脏区可能越过窗口边界，
+        # 会刷出 UpdateLayeredWindowIndirect failed 的 Qt 警告。
         container = QWidget(self)
+        self.container = container
         container.setObjectName("rootContainer")
-        container.setGeometry(10, 10, 380, 580)
+        shell = QVBoxLayout(self)
+        shell.setContentsMargins(10, 10, 10, 10)
+        shell.setSpacing(0)
+        shell.addWidget(container)
         container.setStyleSheet("""
             QWidget#rootContainer {
-                background-color: #050607;
-                border: 1px solid #273546;
-                border-radius: 12px;
+                background-color: #1A1525;
+                border: 1px solid #3D2E55;
+                border-radius: 20px;
             }
         """)
-        shadow = QGraphicsDropShadowEffect()
-        shadow.setBlurRadius(24)
-        shadow.setColor(QColor(0, 0, 0, 150))
-        shadow.setOffset(0, 8)
-        container.setGraphicsEffect(shadow)
 
         root = QVBoxLayout(container)
         root.setContentsMargins(16, 14, 16, 14)
@@ -919,7 +957,7 @@ class TodoWindow(QWidget):
 
         title = QLabel("我的待办")
         title.setFont(QFont("Microsoft YaHei", 15, QFont.Light))
-        title.setStyleSheet("color: #9FB7CC; background: transparent; letter-spacing: 0px;")
+        title.setStyleSheet("color: #B886F8; background: transparent; letter-spacing: 0px;")
         title_layout.addWidget(title)
         title_layout.addStretch()
 
@@ -928,35 +966,65 @@ class TodoWindow(QWidget):
         self.sync_btn.setCursor(Qt.PointingHandCursor)
         self.sync_btn.setStyleSheet("""
             QPushButton {
-                background-color: #07090D;
-                color: #F1EBDD;
-                border: 1px solid #46586B;
-                border-radius: 7px;
+                background-color: #231B32;
+                color: #EAE5F2;
+                border: 1px solid #3D2E55;
+                border-radius: 16px;
                 font-size: 12px;
                 font-weight: 500;
             }
             QPushButton:hover {
-                background-color: #101724;
-                border-color: #9FB7CC;
+                background-color: #2A203B;
+                border-color: #B886F8;
             }
         """)
         self.sync_btn.clicked.connect(self.sync_homework)
         title_layout.addWidget(self.sync_btn)
+
+        window_btn_style = """
+            QPushButton {
+                background-color: #231B32;
+                color: #EAE5F2;
+                border: 1px solid #3D2E55;
+                border-radius: 14px;
+                font-size: 13px;
+                font-weight: 500;
+            }
+            QPushButton:hover {
+                background-color: #2A203B;
+                border-color: #B886F8;
+            }
+        """
+        min_btn = QPushButton("-")
+        min_btn.setFixedSize(28, 28)
+        min_btn.setCursor(Qt.PointingHandCursor)
+        min_btn.setToolTip("最小化")
+        min_btn.setStyleSheet(window_btn_style)
+        min_btn.clicked.connect(self.showMinimized)
+        title_layout.addWidget(min_btn)
+
+        self.maximize_btn = QPushButton("□")
+        self.maximize_btn.setFixedSize(28, 28)
+        self.maximize_btn.setCursor(Qt.PointingHandCursor)
+        self.maximize_btn.setToolTip("最大化/还原")
+        self.maximize_btn.setStyleSheet(window_btn_style)
+        self.maximize_btn.clicked.connect(lambda: window_chrome.toggle_maximize_restore(self))
+        title_layout.addWidget(self.maximize_btn)
 
         close_btn = QPushButton("关闭")
         close_btn.setFixedSize(48, 28)
         close_btn.setCursor(Qt.PointingHandCursor)
         close_btn.setStyleSheet("""
             QPushButton {
-                background-color: #07090D;
-                color: #F1EBDD;
-                border: 1px solid #46586B;
-                border-radius: 7px;
+                background-color: #231B32;
+                color: #EAE5F2;
+                border: 1px solid #3D2E55;
+                border-radius: 16px;
                 font-size: 12px;
             }
             QPushButton:hover {
-                background-color: #20162E;
-                border-color: #775E90;
+                background-color: #3D2E55;
+                border-color: #B886F8;
             }
         """)
         close_btn.clicked.connect(self.close)
@@ -968,7 +1036,7 @@ class TodoWindow(QWidget):
         self.overview_label.setWordWrap(True)
         self.overview_label.setStyleSheet("""
             background: transparent;
-            color: #C6D4E2;
+            color: #D1C8E1;
             padding: 2px 2px;
             font-size: 12px;
             font-weight: 400;
@@ -981,14 +1049,14 @@ class TodoWindow(QWidget):
         self.progress_bar.setFixedHeight(5)
         self.progress_bar.setStyleSheet("""
             QProgressBar {
-                background-color: #10131A;
+                background-color: #231B32;
                 border: none;
-                border-radius: 2px;
+                border-radius: 16px;
             }
             QProgressBar::chunk {
-                border-radius: 2px;
+                border-radius: 16px;
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #34224A, stop:1 #9FB7CC);
+                    stop:0 #4E3C6B, stop:1 #B886F8);
             }
         """)
         root.addWidget(self.progress_bar)
@@ -1000,15 +1068,15 @@ class TodoWindow(QWidget):
         self.input_field.setPlaceholderText("添加新的待办事项")
         self.input_field.setStyleSheet("""
             QLineEdit {
-                border: 1px solid #6F879B;
-                border-radius: 7px;
+                border: 1px solid #4E3C6B;
+                border-radius: 16px;
                 padding: 9px 12px;
                 font-size: 13px;
-                background-color: #07090D;
-                color: #F1EBDD;
-                selection-background-color: #34224A;
+                background-color: #231B32;
+                color: #EAE5F2;
+                selection-background-color: #4E3C6B;
             }
-            QLineEdit:focus { border-color: #9FB7CC; background-color: #090C12; }
+            QLineEdit:focus { border-color: #B886F8; background-color: #1A1525; }
         """)
         self.input_field.returnPressed.connect(self.add_todo_from_input)
         input_layout.addWidget(self.input_field, 1)
@@ -1021,15 +1089,15 @@ class TodoWindow(QWidget):
         self.priority_combo.setFixedHeight(38)
         self.priority_combo.setStyleSheet("""
             QComboBox {
-                background-color: #07090D;
-                color: #F1EBDD;
-                border: 1px solid #6F879B;
-                border-radius: 7px;
+                background-color: #231B32;
+                color: #EAE5F2;
+                border: 1px solid #4E3C6B;
+                border-radius: 16px;
                 padding: 0 8px;
                 font-size: 12px;
                 min-width: 64px;
             }
-            QComboBox:focus { border-color: #9FB7CC; }
+            QComboBox:focus { border-color: #B886F8; }
             QComboBox::drop-down { width: 16px; border: none; }
         """)
         input_layout.addWidget(self.priority_combo)
@@ -1039,14 +1107,14 @@ class TodoWindow(QWidget):
         add_btn.setCursor(Qt.PointingHandCursor)
         add_btn.setStyleSheet("""
             QPushButton {
-                background-color: #20162E;
-                color: #F1EBDD;
-                border: 1px solid #775E90;
-                border-radius: 7px;
+                background-color: #3D2E55;
+                color: #EAE5F2;
+                border: 1px solid #B886F8;
+                border-radius: 16px;
                 font-size: 22px;
                 font-weight: 400;
             }
-            QPushButton:hover { background-color: #34224A; border-color: #B7A6D8; }
+            QPushButton:hover { background-color: #4E3C6B; border-color: #A08CD2; }
         """)
         add_btn.clicked.connect(self.add_todo_from_input)
         input_layout.addWidget(add_btn)
@@ -1059,15 +1127,15 @@ class TodoWindow(QWidget):
         self.search_field.setPlaceholderText("搜索待办 / 标签")
         self.search_field.setStyleSheet("""
             QLineEdit {
-                border: 1px solid #6F879B;
-                border-radius: 7px;
+                border: 1px solid #4E3C6B;
+                border-radius: 16px;
                 padding: 6px 10px;
                 font-size: 12px;
-                background-color: #07090D;
-                color: #F1EBDD;
-                selection-background-color: #34224A;
+                background-color: #231B32;
+                color: #EAE5F2;
+                selection-background-color: #4E3C6B;
             }
-            QLineEdit:focus { border-color: #9FB7CC; background-color: #090C12; }
+            QLineEdit:focus { border-color: #B886F8; background-color: #1A1525; }
         """)
         self.search_field.textChanged.connect(self._on_search_changed)
         search_row.addWidget(self.search_field, 1)
@@ -1077,15 +1145,15 @@ class TodoWindow(QWidget):
             self.category_combo.addItem(label, key)
         self.category_combo.setStyleSheet("""
             QComboBox {
-                background-color: #07090D;
-                color: #F1EBDD;
-                border: 1px solid #6F879B;
-                border-radius: 7px;
+                background-color: #231B32;
+                color: #EAE5F2;
+                border: 1px solid #4E3C6B;
+                border-radius: 16px;
                 padding: 4px 8px;
                 font-size: 12px;
                 min-width: 80px;
             }
-            QComboBox:focus { border-color: #9FB7CC; }
+            QComboBox:focus { border-color: #B886F8; }
             QComboBox::drop-down { width: 16px; border: none; }
         """)
         self.category_combo.currentIndexChanged.connect(self._on_category_changed)
@@ -1111,11 +1179,11 @@ class TodoWindow(QWidget):
         self.clear_done_btn.setStyleSheet("""
             QPushButton {
                 background-color: transparent;
-                color: #A8AEB8;
+                color: #B8ADC9;
                 border: none;
                 font-size: 11px;
             }
-            QPushButton:hover { color: #F1EBDD; text-decoration: underline; }
+            QPushButton:hover { color: #EAE5F2; text-decoration: underline; }
         """)
         self.clear_done_btn.clicked.connect(self._on_clear_done)
         tab_row.addWidget(self.clear_done_btn)
@@ -1133,7 +1201,7 @@ class TodoWindow(QWidget):
                 background: transparent; width: 6px; margin: 0;
             }
             QScrollBar::handle:vertical {
-                background: #46586B; border-radius: 3px; min-height: 24px;
+                background: #3D2E55; border-radius: 16px; min-height: 24px;
             }
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { background: none; border: none; }
         """)
@@ -1149,7 +1217,7 @@ class TodoWindow(QWidget):
         # ============== 底部 stats ==============
         self.stats_label = QLabel("还没有待办事项哦~")
         self.stats_label.setAlignment(Qt.AlignCenter)
-        self.stats_label.setStyleSheet("color: #A8AEB8; font-size: 11px; background: transparent;")
+        self.stats_label.setStyleSheet("color: #B8ADC9; font-size: 11px; background: transparent;")
         root.addWidget(self.stats_label)
 
     # ----- 状态过滤按钮样式 -----
@@ -1160,10 +1228,10 @@ class TodoWindow(QWidget):
             if active:
                 btn.setStyleSheet("""
                     QPushButton {
-                        background-color: #20162E;
-                        color: #F1EBDD;
-                        border: 1px solid #775E90;
-                        border-radius: 7px;
+                        background-color: #3D2E55;
+                        color: #EAE5F2;
+                        border: 1px solid #B886F8;
+                        border-radius: 16px;
                         padding: 0 12px;
                         font-size: 11px;
                         font-weight: 500;
@@ -1173,15 +1241,15 @@ class TodoWindow(QWidget):
                 btn.setStyleSheet("""
                     QPushButton {
                         background-color: transparent;
-                        color: #A8AEB8;
-                        border: 1px solid #46586B;
-                        border-radius: 7px;
+                        color: #B8ADC9;
+                        border: 1px solid #3D2E55;
+                        border-radius: 16px;
                         padding: 0 12px;
                         font-size: 11px;
                     }
                     QPushButton:hover {
-                        border-color: #9FB7CC;
-                        color: #F1EBDD;
+                        border-color: #B886F8;
+                        color: #EAE5F2;
                     }
                 """)
 
@@ -1247,7 +1315,7 @@ class TodoWindow(QWidget):
             empty.setAlignment(Qt.AlignCenter)
             empty.setWordWrap(True)
             empty.setStyleSheet(
-                "color: #6F879B; font-size: 12px; padding: 28px 8px; background: transparent;"
+                "color: #4E3C6B; font-size: 12px; padding: 28px 8px; background: transparent;"
             )
             self.list_layout.addWidget(empty)
         else:
@@ -1358,17 +1426,41 @@ class TodoWindow(QWidget):
 
     # ----- 拖拽：仅在 header 区域生效，避免和列表冲突 -----
     def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            if hasattr(self, "header") and self.header.geometry().contains(event.pos() - QPoint(10, 10)):
-                self._drag_anchor = event.pos()
-                self.drag_offset = event.pos()
-            else:
-                self._drag_anchor = None
+        if window_chrome.begin_window_resize(self, event):
+            return
+        if window_chrome.begin_title_drag(self, event, getattr(self, "header", None)):
+            return
+        super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
-        if event.buttons() == Qt.LeftButton and self._drag_anchor is not None:
-            self.move(self.mapToGlobal(event.pos() - self.drag_offset))
+        if window_chrome.continue_window_resize(self, event):
+            return
+        if window_chrome.continue_title_drag(self, event):
+            return
+        window_chrome.update_resize_cursor(self, event)
+        super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
-        self._drag_anchor = None
+        window_chrome.end_window_resize(self)
+        window_chrome.end_title_drag(self)
+        super().mouseReleaseEvent(event)
+
+    def nativeEvent(self, eventType, message):
+        handled = window_chrome.native_resize_event(self, eventType, message)
+        if handled is not None:
+            return handled
+        return super().nativeEvent(eventType, message)
+
+    def mouseDoubleClickEvent(self, event):
+        if window_chrome.title_double_click_maximize(self, event, getattr(self, "header", None)):
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def leaveEvent(self, event):
+        window_chrome.leave_resize_area(self, event)
+        super().leaveEvent(event)
+
+    def resizeEvent(self, event):
+        window_chrome.sync_maximize_button(self)
+        super().resizeEvent(event)
 

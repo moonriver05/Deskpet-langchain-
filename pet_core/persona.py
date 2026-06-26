@@ -73,8 +73,8 @@ LOCAL_CAPABILITY_REGISTRY = (
     {
         "name": "knowledge_base",
         "label": "知识库",
-        "can": "检索用户导入的本地知识库内容。",
-        "cannot": "不能假装知道未导入或未检索到的资料。",
+        "can": "当用户明确要求查知识库、资料或导入文档时，检索用户导入的本地知识库内容。",
+        "cannot": "不能在普通闲聊中假装已经查过资料，也不能假装知道未导入或未检索到的资料。",
     },
 )
 
@@ -97,6 +97,15 @@ def format_capability_registry_for_prompt():
         "4. 若想帮助学习，只能落到记录待办、拆分任务、建议计时、低频主动提醒这类程序可执行能力。",
     ])
     return "\n".join(lines)
+
+
+try:
+    from pet_core.tool_registry import (
+        AGENT_TOOL_REGISTRY as LOCAL_CAPABILITY_REGISTRY,
+        format_capability_registry_for_prompt,
+    )
+except Exception:
+    pass
 
 
 ALICE_RUNTIME_CAPABILITIES = format_capability_registry_for_prompt()
@@ -152,4 +161,3 @@ def build_current_response_card(user_text, has_attachment=False, local_predictio
 4. 本轮回复策略：先回应用户刚说的话；如果画像、记忆、知识库与本轮输入冲突，以本轮输入为准。
 5. 现实边界：只能说自己能通过程序做到的事；不能说已经触碰、守着、递东西、做饭、泡饮料或持续监视用户。
 6. 输出目标：像有珠本人在聊天，不像说明书；简短、具体、带一点克制的关心。"""
-

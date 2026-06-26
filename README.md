@@ -1,5 +1,4 @@
-[README.md](https://github.com/user-attachments/files/28863794/README.md)
-# 久远寺有珠桌宠 2.0 —— 带记忆与灵魂的桌面伙伴
+# 久远寺有珠桌宠 2.1 —— 带记忆与灵魂的桌面伙伴
 
 <p align="center">
   <img src="./有珠.gif" width="180" alt="有珠桌宠动画">
@@ -10,7 +9,7 @@
   <img alt="Python" src="https://img.shields.io/badge/Python-3.10+-6FA8DC?style=for-the-badge&logo=python&logoColor=white">
   <img alt="PyQt5" src="https://img.shields.io/badge/PyQt5-Desktop-8EA8C3?style=for-the-badge">
   <img alt="LangChain" src="https://img.shields.io/badge/LangChain-Agent-3D2B56?style=for-the-badge">
-  <img alt="Version" src="https://img.shields.io/badge/Version-2.0-1A1A1A?style=for-the-badge">
+  <img alt="Version" src="https://img.shields.io/badge/Version-2.1-1A1A1A?style=for-the-badge">
 </p>
 
 一个基于 PyQt5 的本地桌面宠物程序，拥有记忆系统、向量检索知识库、语音合成、情感表情包、待办清单、主动关怀和定时提醒等功能。
@@ -22,7 +21,7 @@
 ## 目录
 
 - [功能特点](#-功能特点)
-- [2.0 更新亮点](#-20-更新亮点)
+- [2.1 更新亮点](#-21-更新亮点)
 - [安装与依赖](#-安装与依赖)
 - [首次使用配置](#-首次使用配置)
 - [使用指南](#-使用指南)
@@ -88,8 +87,13 @@
 - **拖拽移动**：按住左键即可拖动。
 - **暗色魔女风 UI**：部分窗口已调整为黑、雾霾蓝、暗紫的极简暗色主题。
 
-## 🌙 2.0 更新亮点
+## 🌙 2.1 更新亮点
 
+- 标准化本地 Skill / Tool 注册表，统一记录能力名称、参数结构、风险等级、是否允许主动调用和现实边界。
+- Skill 定义可导出为 MCP tools、OpenAI function tools、项目 manifest 或 Markdown 文档，后续更容易迁移到其他 Agent/Skill 体系。
+- 增加多轮工具意图承接：当有珠上一轮问“要不要帮你记成待办/开计时”，用户下一句只说“好，帮我记一下”时，也能回到上一句内容执行。
+- 工具执行、待确认工具意图会写入学习反馈日志，为后续 MLP 策略模型和推荐器训练提供更细粒度样本。
+- RSS 管理与推荐链路继续增强，支持管理用户自定义源、缓存条目、原链接打开和推荐点击反馈。
 - 从单文件逐步拆成模块，当前已拆出 `pet_core/`、`pet_memory/`、`pet_services/`、`pet_features/`。
 - 短期记忆、长期记忆、用户画像分层，不再把所有记忆粗暴塞进 prompt。
 - 记忆检索加入最近上下文、中文词面召回、2/3-gram、MySQL LIKE、本地融合分数和 DeepSeek 重排。

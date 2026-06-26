@@ -12,12 +12,16 @@ import math
 import concurrent.futures
 import threading
 import uuid
+import ctypes
+import ctypes.wintypes
+import tempfile
 import PyQt5
 from openai import OpenAI
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 from zhdate import ZhDate
 from pet_core.config import CONFIG_SCHEMA, REQUIRED_KEYS, app_config
+from pet_core import window_chrome
 from pet_core.persona import (
     ALICE_PROACTIVE_PERSONA,
     ALICE_RESPONSE_STYLE,
@@ -26,13 +30,43 @@ from pet_core.persona import (
     build_current_response_card,
     format_capability_registry_for_prompt,
 )
+from pet_core.pending_intent import (
+    PendingIntentStore,
+    build_pending_intent_from_reply,
+)
 from pet_core.proactive import (
     clean_proactive_message,
     format_proactive_context_for_prompt,
+    is_repetitive_proactive_message,
 )
+from pet_core.auto_labeler import (
+    schedule_auto_label_batch,
+    schedule_auto_relabel_event,
+)
+from pet_core.learning_logger import (
+    build_interaction_event,
+    log_feedback_event,
+    log_implicit_state_observation,
+    log_interaction_event,
+)
+from pet_core.knowledge_router import should_search_knowledge_base
+from pet_core.recommender import (
+    format_recommendation_for_prompt,
+    recommendation_runtime,
+)
+from pet_core.rss_content import (
+    format_external_content_for_prompt,
+    format_external_content_recommendation_message,
+    rss_content_runtime,
+)
+from pet_core.rsshub_service import (
+    configure_local_rsshub_base,
+    start_local_rsshub_background,
+)
+from pet_core.strategy_predictor import strategy_predictor_runtime
+from pet_core.system_state import collect_system_state
 from pet_core.timer_parser import (
     format_focus_duration,
-    parse_focus_timer_intent,
 )
 from pet_features.todo_system import (
     TodoToolRouterThread,
@@ -40,6 +74,8 @@ from pet_features.todo_system import (
     has_explicit_todo_write_intent,
     todo_store,
 )
+from pet_features.learning_label_window import LearningLabelWindow
+from pet_features.rss_manager_window import RSSManagerWindow
 from pet_memory.memory_system import (
     DB_CONFIG,
     DB_NAME,
@@ -240,18 +276,19 @@ from PyQt5.QtWidgets import (
     QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout,
     QPushButton, QLineEdit, QListWidget, QListWidgetItem,
     QCheckBox, QMessageBox, QMenu, QScrollArea, QDesktopWidget,
-    QGraphicsDropShadowEffect, QFileDialog, QFrame, QComboBox,
+    QFileDialog, QFrame, QComboBox,
     QSizePolicy, QStackedWidget, QDialog, QFormLayout, QSpinBox,
     QPlainTextEdit, QTextEdit, QSplitter, QTabWidget, QTableWidget,
     QTableWidgetItem, QHeaderView, QAbstractItemView, QProgressBar
 )
 from PyQt5.QtCore import (
     Qt, QPoint, QTimer, QSize, QThread, pyqtSignal, QObject,
-    QPropertyAnimation, QEasingCurve, QRect
+    QPropertyAnimation, QEasingCurve, QRect, QUrl, QLockFile,
+    qInstallMessageHandler
 )
 from PyQt5.QtGui import (
     QPixmap, QPainter, QFont, QColor, QPolygon, QMovie, QIcon,
-    QLinearGradient, QBrush, QPen
+    QLinearGradient, QBrush, QPen, QDesktopServices
 )
 from pet_services.tts_service import (
     TTSSynthThread,
@@ -263,48 +300,94 @@ from pet_services.tts_service import (
 
 
 def apply_dark_window_chrome(widget):
-    """Make native Windows title bars match the app's dark theme when available."""
-    try:
-        pixmap = QPixmap(1, 1)
-        pixmap.fill(Qt.transparent)
-        widget.setWindowIcon(QIcon(pixmap))
-    except Exception:
-        pass
+    """设置无边框窗口和透明背景。
 
-    if os.name != "nt":
-        return
-    try:
-        import ctypes
-        hwnd = int(widget.winId())
-        dwmapi = ctypes.windll.dwmapi
-        enabled = ctypes.c_int(1)
-        for attr in (20, 19):  # DWMWA_USE_IMMERSIVE_DARK_MODE; older fallback
-            try:
-                dwmapi.DwmSetWindowAttribute(
-                    hwnd, attr, ctypes.byref(enabled), ctypes.sizeof(enabled)
-                )
-            except Exception:
-                pass
+    注意：不要在顶层透明窗口上挂 QGraphicsDropShadowEffect。Windows 的
+    layered window 会把阴影区域计入 dirty rect，若超出窗口边界就会反复
+    打印 UpdateLayeredWindowIndirect failed。
+    """
+    widget.setWindowFlags(widget.windowFlags() | Qt.Window | Qt.FramelessWindowHint)
+    widget.setAttribute(Qt.WA_TranslucentBackground)
 
-        def colorref(hex_color):
-            h = hex_color.lstrip("#")
-            r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-            return ctypes.c_int(r | (g << 8) | (b << 16))
 
-        for attr, color in (
-            (35, "#050607"),  # DWMWA_CAPTION_COLOR
-            (36, "#F1EBDD"),  # DWMWA_TEXT_COLOR
-            (34, "#273546"),  # DWMWA_BORDER_COLOR
-        ):
-            value = colorref(color)
-            try:
-                dwmapi.DwmSetWindowAttribute(
-                    hwnd, attr, ctypes.byref(value), ctypes.sizeof(value)
-                )
-            except Exception:
-                pass
-    except Exception:
-        pass
+def install_qt_message_filter():
+    """Silence noisy Windows layered-window warnings without hiding real errors."""
+    def _handler(mode, context, message):
+        text = str(message or "")
+        if "UpdateLayeredWindowIndirect failed" in text:
+            return
+        try:
+            sys.stderr.write(text + "\n")
+        except Exception:
+            pass
+
+    qInstallMessageHandler(_handler)
+
+
+def acquire_single_instance_lock():
+    """Prevent two desktop-pet processes from fighting over DB/RSS/Chroma/logs."""
+    lock_dir = os.path.join(tempfile.gettempdir(), "YuzuDeskpet")
+    os.makedirs(lock_dir, exist_ok=True)
+    lock = QLockFile(os.path.join(lock_dir, "deskpet.lock"))
+    lock.setStaleLockTime(30 * 1000)
+    if not lock.tryLock(100):
+        QMessageBox.information(
+            None,
+            "有珠已经在运行",
+            "已经有一个桌宠进程在运行了。\n"
+            "如果桌宠卡住了，请先关闭旧窗口或结束旧的 python pet.py 进程，再重新启动。",
+        )
+        return None
+    return lock
+
+
+def _is_interactive_widget(widget):
+    while widget is not None:
+        if isinstance(widget, (
+            QPushButton,
+            QLineEdit,
+            QTextEdit,
+            QPlainTextEdit,
+            QComboBox,
+            QSpinBox,
+            QListWidget,
+            QTableWidget,
+            QScrollArea,
+        )):
+            return True
+        widget = widget.parentWidget()
+    return False
+
+
+def _begin_window_drag(window, event, drag_widget=None, max_y=None):
+    if event.button() != Qt.LeftButton:
+        return False
+    if drag_widget is not None:
+        top_left = drag_widget.mapTo(window, QPoint(0, 0))
+        if not drag_widget.rect().translated(top_left).contains(event.pos()):
+            return False
+    elif max_y is not None and event.pos().y() > max_y:
+        return False
+    if _is_interactive_widget(window.childAt(event.pos())):
+        return False
+    window._dragging = True
+    window._drag_offset = event.globalPos() - window.frameGeometry().topLeft()
+    event.accept()
+    return True
+
+
+def _continue_window_drag(window, event):
+    if getattr(window, "_dragging", False) and getattr(window, "_drag_offset", None) is not None:
+        if event.buttons() == Qt.LeftButton:
+            window.move(event.globalPos() - window._drag_offset)
+            event.accept()
+            return True
+    return False
+
+
+def _end_window_drag(window):
+    window._dragging = False
+    window._drag_offset = None
 
 
 # ark_api_key 已经在文件顶部声明，apply_config_to_globals() 会从 AppConfig 注入。
@@ -321,102 +404,138 @@ class SettingsWindow(QDialog):
         super().__init__(parent)
         self.setWindowTitle("桌宠设置")
         apply_dark_window_chrome(self)
-        self.resize(780, 560)
+        self.resize(820, 600)
+        window_chrome.setup_resizable_frameless_window(self, minimum_size=(640, 460))
+        self.maximize_btn = None
+        self._dragging = False
+        self._drag_offset = None
         self.setStyleSheet("""
             QDialog {
-                background: #050607;
-                color: #F1EBDD;
-                font-family: "Microsoft YaHei";
+                background: transparent;
+                color: #E0E0E0;
+                font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;
             }
-            QWidget { background: #050607; color: #F1EBDD; }
-            QListWidget {
-                background: #07090D;
-                color: #A8B8C9;
+            QFrame#SettingsContainer {
+                background: #1A1525;
+                border: 1px solid #3D2E55;
+                border-radius: 20px;
+            }
+            QFrame#SettingsTitleBar {
+                background: transparent;
                 border: none;
-                border-right: 1px solid #273546;
-                padding: 8px;
-                font-size: 13px;
+                border-bottom: 1px solid #2A203B;
+            }
+            QLabel#windowTitle {
+                color: #B886F8;
+                font-size: 14px;
+                font-weight: 500;
+                background: transparent;
+            }
+            QWidget { background: transparent; color: #E0E0E0; }
+            QListWidget {
+                background: #15151D;
+                color: #A0A0B0;
+                border: none;
+                border-right: 1px solid #2A2A3C;
+                padding: 10px;
+                font-size: 14px;
                 outline: 0;
             }
             QListWidget::item {
-                padding: 10px 12px;
-                border-radius: 7px;
-                margin: 2px 0;
+                padding: 12px 14px;
+                border-radius: 16px;
+                margin: 4px 0;
             }
             QListWidget::item:hover {
-                background: #101724;
-                color: #F1EBDD;
+                background: #252535;
+                color: #FFFFFF;
             }
             QListWidget::item:selected {
-                background: #20162E;
-                color: #F1EBDD;
-                border: 1px solid #775E90;
+                background: rgba(169, 123, 255, 0.15);
+                color: #A97BFF;
+                border: 1px solid #A97BFF;
+                font-weight: bold;
             }
             QLineEdit, QSpinBox, QPlainTextEdit {
-                background: #07090D;
-                color: #F1EBDD;
-                border: 1px solid #6F879B;
-                border-radius: 6px;
-                padding: 7px 9px;
-                font-size: 13px;
-                selection-background-color: #34224A;
+                background: #252535;
+                color: #FFFFFF;
+                border: 1px solid #3D3D52;
+                border-radius: 16px;
+                padding: 8px 12px;
+                font-size: 14px;
+                selection-background-color: #A97BFF;
             }
             QLineEdit:focus, QSpinBox:focus, QPlainTextEdit:focus {
-                border: 1px solid #9FB7CC;
-                background: #090C12;
+                border: 1px solid #A97BFF;
+                background: #2A2A3C;
             }
-            QLabel#desc { color: #A8AEB8; font-size: 12px; }
-            QLabel#hint { color: #6F879B; font-size: 11px; font-style: italic; }
-            QLabel#title { font-size: 17px; font-weight: 300; color: #9FB7CC; }
+            QLabel#desc { color: #A0A0B0; font-size: 13px; }
+            QLabel#hint { color: #6D6D8A; font-size: 12px; font-style: italic; }
+            QLabel#title { font-size: 18px; font-weight: bold; color: #A97BFF; }
             QPushButton {
-                background: #1E2B3A;
-                color: #F1EBDD;
-                border: 1px solid #6F879B;
-                border-radius: 7px;
+                background: #252535;
+                color: #E0E0E0;
+                border: 1px solid #3D3D52;
+                border-radius: 16px;
                 padding: 8px 18px;
-                font-weight: 500;
+                font-weight: bold;
+                font-size: 14px;
             }
             QPushButton:hover {
-                background: #2A3A4E;
-                border-color: #9FB7CC;
+                background: #3D2E55;
+                border-color: #A97BFF;
+                color: #A97BFF;
             }
             QPushButton[role="ghost"] {
                 background: transparent;
-                color: #C6D4E2;
-                border: 1px solid #46586B;
+                color: #A0A0B0;
+                border: 1px solid #3D3D52;
             }
             QPushButton[role="ghost"]:hover {
-                background: #101724;
-                color: #F1EBDD;
-                border-color: #9FB7CC;
+                background: #2A2A3C;
+                color: #FFFFFF;
+                border-color: #A97BFF;
+            }
+            QPushButton[role="title"] {
+                background: transparent;
+                color: #B8ADC9;
+                border: none;
+                border-radius: 12px;
+                padding: 0;
+                font-size: 13px;
+                font-weight: bold;
+            }
+            QPushButton[role="title"]:hover {
+                background: #2A203B;
+                color: #EAE5F2;
             }
             QPushButton[role="eye"] {
                 background: transparent;
-                color: #9FB7CC;
+                color: #A97BFF;
                 border: none;
                 padding: 0px; font-size: 14px;
             }
-            QPushButton[role="eye"]:hover { color: #F1EBDD; }
+            QPushButton[role="eye"]:hover { color: #FFFFFF; }
             QPushButton[role="picker"] {
-                background: #07090D;
-                color: #C6D4E2;
-                border: 1px solid #46586B;
+                background: #15151D;
+                color: #E0E0E0;
+                border: 1px solid #3D2E55;
                 padding: 5px 11px;
                 font-weight: normal;
             }
             QPushButton[role="picker"]:hover {
-                background: #101724;
-                border-color: #9FB7CC;
+                background: #2A203B;
+                border-color: #B886F8;
             }
             QScrollArea { background: transparent; border: none; }
             QScrollBar:vertical {
-                background: #050607;
+                background: #1A1525;
                 width: 8px;
                 margin: 0;
             }
             QScrollBar::handle:vertical {
-                background: #46586B;
-                border-radius: 4px;
+                background: #3D2E55;
+                border-radius: 16px;
                 min-height: 24px;
             }
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
@@ -428,9 +547,49 @@ class SettingsWindow(QDialog):
         # field_key (str like "mysql.password") → QWidget（输入控件）
         self._inputs = {}
 
-        outer = QVBoxLayout(self)
+        shell = QVBoxLayout(self)
+        shell.setContentsMargins(20, 20, 20, 20)
+        shell.setSpacing(0)
+        self.container = QFrame(self)
+        self.container.setObjectName("SettingsContainer")
+        shell.addWidget(self.container)
+
+        outer = QVBoxLayout(self.container)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
+
+        self.title_bar = QFrame()
+        self.title_bar.setObjectName("SettingsTitleBar")
+        self.title_bar.setFixedHeight(40)
+        title_layout = QHBoxLayout(self.title_bar)
+        title_layout.setContentsMargins(16, 0, 10, 0)
+        title_layout.setSpacing(8)
+        title = QLabel("桌宠设置")
+        title.setObjectName("windowTitle")
+        title_layout.addWidget(title)
+        title_layout.addStretch()
+
+        min_btn = QPushButton("—")
+        min_btn.setFixedSize(26, 24)
+        min_btn.setToolTip("最小化")
+        min_btn.setProperty("role", "title")
+        min_btn.clicked.connect(self.showMinimized)
+        title_layout.addWidget(min_btn)
+
+        self.maximize_btn = QPushButton("□")
+        self.maximize_btn.setFixedSize(26, 24)
+        self.maximize_btn.setToolTip("最大化/还原")
+        self.maximize_btn.setProperty("role", "title")
+        self.maximize_btn.clicked.connect(lambda: window_chrome.toggle_maximize_restore(self))
+        title_layout.addWidget(self.maximize_btn)
+
+        close_btn = QPushButton("✕")
+        close_btn.setFixedSize(26, 24)
+        close_btn.setToolTip("关闭")
+        close_btn.setProperty("role", "title")
+        close_btn.clicked.connect(self.reject)
+        title_layout.addWidget(close_btn)
+        outer.addWidget(self.title_bar)
 
         body = QHBoxLayout()
         body.setContentsMargins(0, 0, 0, 0)
@@ -446,7 +605,7 @@ class SettingsWindow(QDialog):
 
         # 右侧堆叠
         self.stack = QStackedWidget()
-        self.stack.setStyleSheet("background: #050607;")
+        self.stack.setStyleSheet("background: #1A1525;")
         for section in CONFIG_SCHEMA:
             page = self._build_section_page(section)
             self.stack.addWidget(page)
@@ -459,7 +618,7 @@ class SettingsWindow(QDialog):
         footer = QHBoxLayout()
         footer.setContentsMargins(15, 10, 15, 15)
         self.status_label = QLabel("")
-        self.status_label.setStyleSheet("color: #B7A6D8; font-size: 12px;")
+        self.status_label.setStyleSheet("color: #A08CD2; font-size: 12px;")
         footer.addWidget(self.status_label, 1)
 
         btn_reset = QPushButton("恢复默认")
@@ -489,7 +648,46 @@ class SettingsWindow(QDialog):
 
     def showEvent(self, event):
         super().showEvent(event)
-        apply_dark_window_chrome(self)
+        window_chrome.sync_maximize_button(self)
+
+    def nativeEvent(self, eventType, message):
+        handled = window_chrome.native_resize_event(self, eventType, message)
+        if handled is not None:
+            return handled
+        return super().nativeEvent(eventType, message)
+
+    def mousePressEvent(self, event):
+        if window_chrome.begin_window_resize(self, event):
+            return
+        if window_chrome.begin_title_drag(self, event, getattr(self, "title_bar", None)):
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if window_chrome.continue_window_resize(self, event):
+            return
+        if window_chrome.continue_title_drag(self, event):
+            return
+        window_chrome.update_resize_cursor(self, event)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        window_chrome.end_window_resize(self)
+        window_chrome.end_title_drag(self)
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if window_chrome.title_double_click_maximize(self, event, getattr(self, "title_bar", None)):
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def leaveEvent(self, event):
+        window_chrome.leave_resize_area(self, event)
+        super().leaveEvent(event)
+
+    def resizeEvent(self, event):
+        window_chrome.sync_maximize_button(self)
+        super().resizeEvent(event)
 
     # ---------- 构造每个分类的表单 ----------
     def _build_section_page(self, section):
@@ -530,7 +728,7 @@ class SettingsWindow(QDialog):
             if field.get("required"):
                 label_text += " *"
             label = QLabel(label_text)
-            label.setStyleSheet("font-size: 13px; color: #C6D4E2;")
+            label.setStyleSheet("font-size: 13px; color: #D1C8E1;")
             form.addRow(label, row_widget)
 
         form_holder.setWidget(form_widget)
@@ -550,6 +748,24 @@ class SettingsWindow(QDialog):
                 inp.setValue(int(current_value))
             except (TypeError, ValueError):
                 inp.setValue(int(field.get("default", 0) or 0))
+            row = QWidget()
+            row.setStyleSheet("background: transparent;")
+            row_l = QVBoxLayout(row)
+            row_l.setContentsMargins(0, 0, 0, 0)
+            row_l.setSpacing(2)
+            row_l.addWidget(inp)
+            if field.get("hint"):
+                hint = QLabel(field["hint"])
+                hint.setObjectName("hint")
+                hint.setWordWrap(True)
+                row_l.addWidget(hint)
+            return row, inp
+
+        if ftype == "text":
+            inp = QPlainTextEdit()
+            inp.setPlainText(str(current_value) if current_value is not None else "")
+            inp.setPlaceholderText(str(field.get("default", "")))
+            inp.setMinimumHeight(96)
             row = QWidget()
             row.setStyleSheet("background: transparent;")
             row_l = QVBoxLayout(row)
@@ -628,6 +844,8 @@ class SettingsWindow(QDialog):
         for full_key, widget in self._inputs.items():
             if isinstance(widget, QSpinBox):
                 out[full_key] = int(widget.value())
+            elif isinstance(widget, QPlainTextEdit):
+                out[full_key] = widget.toPlainText().strip()
             elif isinstance(widget, QLineEdit):
                 out[full_key] = widget.text().strip()
             else:
@@ -700,6 +918,11 @@ class SettingsWindow(QDialog):
             reset_tts_client_state()
         except Exception as e:
             print(f"[Settings] 重置 TTS weights 标记失败：{e}")
+        try:
+            configure_local_rsshub_base()
+            start_local_rsshub_background()
+        except Exception as e:
+            print(f"[Settings] 应用本地 RSSHub 配置失败：{e}")
 
     def _on_reset_clicked(self):
         confirm = QMessageBox.question(
@@ -720,6 +943,8 @@ class SettingsWindow(QDialog):
                         widget.setValue(int(default))
                     except (TypeError, ValueError):
                         widget.setValue(0)
+                elif isinstance(widget, QPlainTextEdit):
+                    widget.setPlainText(str(default) if default is not None else "")
                 elif isinstance(widget, QLineEdit):
                     widget.setText(str(default) if default is not None else "")
 
@@ -772,83 +997,114 @@ class MemoryManagerWindow(QWidget):
         super().__init__()
         self.pet = pet
         self.current_rows = []
+        self._dragging = False
+        self._drag_offset = None
         self.setWindowTitle("记忆管理")
         apply_dark_window_chrome(self)
         self.resize(980, 680)
+        window_chrome.setup_resizable_frameless_window(self, minimum_size=(760, 520))
+        self.maximize_btn = None
+        
+        # 同样包裹 QFrame 以实现发光阴影与圆角
+        self.container = QFrame(self)
+        self.container.setObjectName("MainContainer")
+        
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(20, 20, 20, 20)
+        main_layout.addWidget(self.container)
+        
         self.init_ui()
         self.refresh()
 
     def showEvent(self, event):
         super().showEvent(event)
-        apply_dark_window_chrome(self)
+        
+        # 窗口弹出动画
+        self.setWindowOpacity(0.0)
+        self.anim = QPropertyAnimation(self, b"windowOpacity")
+        self.anim.setDuration(250)
+        self.anim.setStartValue(0.0)
+        self.anim.setEndValue(1.0)
+        self.anim.start()
+        window_chrome.sync_maximize_button(self)
 
     def init_ui(self):
         self.setStyleSheet("""
-            QWidget { background: #050607; color: #F1EBDD; font-family: "Microsoft YaHei"; }
-            QLabel { background: transparent; color: #A8B8C9; }
+            QFrame#MainContainer {
+                background: #1A1525;
+                border-radius: 20px;
+                border: 1px solid #3D2E55;
+            }
+            QFrame#MemoryTitleBar {
+                background: transparent;
+                border: none;
+                border-bottom: 1px solid #2A203B;
+            }
+            QWidget { background: transparent; color: #EAE5F2; font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif; }
+            QLabel { background: transparent; color: #B8ADC9; }
             QLineEdit, QPlainTextEdit, QComboBox {
-                background: #07090D;
-                color: #F1EBDD;
-                border: 1px solid #6F879B;
-                border-radius: 6px;
+                background: #231B32;
+                color: #EAE5F2;
+                border: 1px solid #4E3C6B;
+                border-radius: 16px;
                 padding: 7px 9px;
                 font-size: 13px;
-                selection-background-color: #34224A;
+                selection-background-color: #4E3C6B;
             }
             QLineEdit:focus, QPlainTextEdit:focus, QComboBox:focus {
-                border-color: #9FB7CC;
-                background: #090C12;
+                border-color: #B886F8;
+                background: #1A1525;
             }
             QComboBox::drop-down { width: 18px; border: none; }
             QPushButton {
-                background: #1E2B3A;
-                color: #F1EBDD;
-                border: 1px solid #6F879B;
-                border-radius: 7px;
+                background: #2A203B;
+                color: #EAE5F2;
+                border: 1px solid #4E3C6B;
+                border-radius: 16px;
                 padding: 7px 13px;
                 font-weight: 500;
             }
             QPushButton:hover {
-                background: #2A3A4E;
-                border-color: #9FB7CC;
+                background: #3D2E55;
+                border-color: #B886F8;
             }
             QPushButton[role="danger"] {
-                background: #34224A;
-                border-color: #775E90;
-                color: #F1EBDD;
+                background: #4E3C6B;
+                border-color: #B886F8;
+                color: #EAE5F2;
             }
-            QPushButton[role="danger"]:hover { background: #473160; }
+            QPushButton[role="danger"]:hover { background: #634D85; }
             QPushButton[role="ghost"] {
                 background: transparent;
-                color: #C6D4E2;
-                border: 1px solid #46586B;
+                color: #D1C8E1;
+                border: 1px solid #3D2E55;
             }
             QTableWidget {
-                background: #050607;
-                alternate-background-color: #10131A;
-                color: #F1EBDD;
-                border: 1px solid #46586B;
-                border-radius: 8px;
-                gridline-color: #171B24;
+                background: #1A1525;
+                alternate-background-color: #231B32;
+                color: #EAE5F2;
+                border: 1px solid #3D2E55;
+                border-radius: 16px;
+                gridline-color: #231B32;
                 selection-background-color: rgba(159, 183, 204, 58);
                 selection-color: #FFFFFF;
             }
             QHeaderView::section {
-                background: #20162E;
-                color: #F1EBDD;
+                background: #3D2E55;
+                color: #EAE5F2;
                 border: none;
-                border-right: 1px solid #34224A;
+                border-right: 1px solid #4E3C6B;
                 padding: 7px;
                 font-weight: 600;
             }
             QScrollBar:vertical {
-                background: #050607;
+                background: #1A1525;
                 width: 8px;
                 margin: 0;
             }
             QScrollBar::handle:vertical {
-                background: #46586B;
-                border-radius: 4px;
+                background: #3D2E55;
+                border-radius: 16px;
                 min-height: 24px;
             }
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
@@ -857,14 +1113,19 @@ class MemoryManagerWindow(QWidget):
             }
         """)
 
-        root = QVBoxLayout(self)
+        root = QVBoxLayout(self.container)
         root.setContentsMargins(14, 14, 14, 14)
         root.setSpacing(10)
 
-        header = QHBoxLayout()
+        self.header_bar = QFrame()
+        self.header_bar.setObjectName("MemoryTitleBar")
+        self.header_bar.setFixedHeight(42)
+        header = QHBoxLayout(self.header_bar)
+        header.setContentsMargins(2, 0, 2, 0)
+        header.setSpacing(8)
         title = QLabel("记忆管理")
         title.setFont(QFont("Microsoft YaHei", 17, QFont.Light))
-        title.setStyleSheet("color: #9FB7CC; letter-spacing: 0px;")
+        title.setStyleSheet("color: #B886F8; letter-spacing: 0px;")
         header.addWidget(title)
         header.addStretch()
         refresh_profile_btn = QPushButton("刷新画像")
@@ -875,7 +1136,43 @@ class MemoryManagerWindow(QWidget):
         refine_pending_btn.setToolTip("最多处理 10 条还没进入 Profile Refiner 的长期记忆；会调用画像精炼模型")
         refine_pending_btn.clicked.connect(self.refine_pending_memories)
         header.addWidget(refine_pending_btn)
-        root.addLayout(header)
+
+        window_btn_style = """
+            QPushButton {
+                background: transparent;
+                color: #B8ADC9;
+                border: none;
+                border-radius: 12px;
+                padding: 0;
+                font-size: 13px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background: #2A203B;
+                color: #EAE5F2;
+            }
+        """
+        min_btn = QPushButton("-")
+        min_btn.setFixedSize(26, 24)
+        min_btn.setToolTip("最小化")
+        min_btn.setStyleSheet(window_btn_style)
+        min_btn.clicked.connect(self.showMinimized)
+        header.addWidget(min_btn)
+
+        self.maximize_btn = QPushButton("□")
+        self.maximize_btn.setFixedSize(26, 24)
+        self.maximize_btn.setToolTip("最大化/还原")
+        self.maximize_btn.setStyleSheet(window_btn_style)
+        self.maximize_btn.clicked.connect(lambda: window_chrome.toggle_maximize_restore(self))
+        header.addWidget(self.maximize_btn)
+
+        close_title_btn = QPushButton("×")
+        close_title_btn.setFixedSize(26, 24)
+        close_title_btn.setToolTip("关闭")
+        close_title_btn.setStyleSheet(window_btn_style)
+        close_title_btn.clicked.connect(self.close)
+        header.addWidget(close_title_btn)
+        root.addWidget(self.header_bar)
 
         filters = QHBoxLayout()
         self.mode_combo = QComboBox()
@@ -916,7 +1213,7 @@ class MemoryManagerWindow(QWidget):
 
         meta_row = QHBoxLayout()
         self.selected_label = QLabel("未选择")
-        self.selected_label.setStyleSheet("color: #A8AEB8;")
+        self.selected_label.setStyleSheet("color: #B8ADC9;")
         meta_row.addWidget(self.selected_label)
         meta_row.addStretch()
         meta_row.addWidget(QLabel("分类/字段"))
@@ -975,6 +1272,45 @@ class MemoryManagerWindow(QWidget):
             password=DB_CONFIG['password'], database=DB_NAME,
             charset=DB_CONFIG['charset'], cursorclass=pymysql.cursors.DictCursor
         )
+
+    def mousePressEvent(self, event):
+        if window_chrome.begin_window_resize(self, event):
+            return
+        if window_chrome.begin_title_drag(self, event, getattr(self, "header_bar", None)):
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if window_chrome.continue_window_resize(self, event):
+            return
+        if window_chrome.continue_title_drag(self, event):
+            return
+        window_chrome.update_resize_cursor(self, event)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        window_chrome.end_window_resize(self)
+        window_chrome.end_title_drag(self)
+        super().mouseReleaseEvent(event)
+
+    def nativeEvent(self, eventType, message):
+        handled = window_chrome.native_resize_event(self, eventType, message)
+        if handled is not None:
+            return handled
+        return super().nativeEvent(eventType, message)
+
+    def mouseDoubleClickEvent(self, event):
+        if window_chrome.title_double_click_maximize(self, event, getattr(self, "header_bar", None)):
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def leaveEvent(self, event):
+        window_chrome.leave_resize_area(self, event)
+        super().leaveEvent(event)
+
+    def resizeEvent(self, event):
+        window_chrome.sync_maximize_button(self)
+        super().resizeEvent(event)
 
     def _mode(self):
         return self.mode_combo.currentData() or "short"
@@ -1069,11 +1405,11 @@ class MemoryManagerWindow(QWidget):
             for c, value in enumerate(values):
                 item = QTableWidgetItem("" if value is None else str(value))
                 item.setData(Qt.UserRole, row)
-                item.setForeground(QBrush(QColor("#F1EBDD")))
+                item.setForeground(QBrush(QColor("#EAE5F2")))
                 if r % 2:
-                    item.setBackground(QBrush(QColor("#10131A")))
+                    item.setBackground(QBrush(QColor("#231B32")))
                 else:
-                    item.setBackground(QBrush(QColor("#050607")))
+                    item.setBackground(QBrush(QColor("#1A1525")))
                 self.table.setItem(r, c, item)
 
         self.table.resizeColumnsToContents()
@@ -1342,89 +1678,143 @@ class FocusTimerWindow(QWidget):
         self.pet = pet
         self.is_collapsed = False
         self._expanded_geometry = None
+        self._dragging = False
+        self._drag_offset = None
         self.setWindowTitle("专注定时器")
-        apply_dark_window_chrome(self)
-        self.resize(320, 220)
         self.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
+        apply_dark_window_chrome(self)
+        self.resize(320, 210)
         self.setStyleSheet("""
             QWidget {
-                background: #050607;
-                color: #F1EBDD;
-                font-family: "Microsoft YaHei";
+                background: transparent;
+                color: #EAE5F2;
+                font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;
+            }
+            QFrame#focusTimerCard {
+                background: #1A1525;
+                border: 1px solid #3D2E55;
+                border-radius: 20px;
             }
             QLabel#timerDisplay {
-                background: #07090D;
-                color: #F1EBDD;
-                border: 1px solid #6F879B;
-                border-radius: 8px;
-                font-size: 34px;
+                background: transparent;
+                color: #EAE5F2;
+                border: none;
+                font-size: 38px;
                 font-weight: 600;
-                padding: 14px;
+                padding: 6px 0 2px 0;
             }
             QLabel#fieldLabel {
-                color: #9FB7CC;
+                color: #B8ADC9;
                 font-size: 12px;
             }
+            QLabel#timerTitle {
+                color: #B8ADC9;
+                font-size: 12px;
+                font-weight: 500;
+            }
             QSpinBox {
-                background: #07090D;
-                color: #F1EBDD;
-                border: 1px solid #6F879B;
-                border-radius: 6px;
-                padding: 6px;
+                background: #231B32;
+                color: #EAE5F2;
+                border: 1px solid #4E3C6B;
+                border-radius: 12px;
+                padding: 5px 8px;
                 font-size: 14px;
+            }
+            QSpinBox:focus {
+                border-color: #B886F8;
+                background: #20192D;
             }
             QPushButton {
-                border: 1px solid #46586B;
-                border-radius: 6px;
+                border: 1px solid #3D2E55;
+                border-radius: 16px;
                 padding: 8px 12px;
-                background: #07090D;
-                color: #F1EBDD;
+                background: #231B32;
+                color: #EAE5F2;
                 font-size: 14px;
             }
-            QPushButton:hover { background: #101724; border-color: #9FB7CC; }
+            QPushButton:hover { background: #2A203B; border-color: #B886F8; }
             QPushButton#primaryButton {
-                background: #20162E;
-                color: #F1EBDD;
-                border-color: #775E90;
+                background: #3D2E55;
+                color: #EAE5F2;
+                border-color: #B886F8;
                 font-weight: 600;
             }
-            QPushButton#primaryButton:hover { background: #34224A; border-color: #B7A6D8; }
+            QPushButton#primaryButton:hover { background: #4E3C6B; border-color: #A08CD2; }
+            QPushButton#timerCloseButton {
+                background: transparent;
+                color: #B8ADC9;
+                border: none;
+                border-radius: 12px;
+                padding: 0;
+                font-size: 14px;
+                font-weight: bold;
+            }
+            QPushButton#timerCloseButton:hover {
+                background: #2A203B;
+                color: #EAE5F2;
+            }
         """)
         self._build_ui()
         self.refresh_state()
 
     def showEvent(self, event):
         super().showEvent(event)
-        if not self.is_collapsed:
-            apply_dark_window_chrome(self)
 
     def _build_ui(self):
         self.root_layout = QVBoxLayout(self)
-        self.root_layout.setContentsMargins(14, 14, 14, 14)
-        self.root_layout.setSpacing(12)
+        self.root_layout.setContentsMargins(10, 10, 10, 10)
+        self.root_layout.setSpacing(0)
+
+        self.timer_card = QFrame()
+        self.timer_card.setObjectName("focusTimerCard")
+        self.card_layout = QVBoxLayout(self.timer_card)
+        self.card_layout.setContentsMargins(16, 12, 16, 14)
+        self.card_layout.setSpacing(8)
+
+        self.title_panel = QWidget()
+        title_layout = QHBoxLayout(self.title_panel)
+        title_layout.setContentsMargins(0, 0, 0, 0)
+        title_layout.setSpacing(8)
+        timer_title = QLabel("专注计时")
+        timer_title.setObjectName("timerTitle")
+        title_layout.addWidget(timer_title)
+        title_layout.addStretch()
+        self.close_btn = QPushButton("×")
+        self.close_btn.setObjectName("timerCloseButton")
+        self.close_btn.setFixedSize(24, 24)
+        self.close_btn.setToolTip("关闭计时器窗口")
+        self.close_btn.clicked.connect(self.close)
+        title_layout.addWidget(self.close_btn)
+        self.card_layout.addWidget(self.title_panel)
 
         self.display_label = QLabel("25:00")
         self.display_label.setObjectName("timerDisplay")
         self.display_label.setAlignment(Qt.AlignCenter)
+        self.display_label.setMinimumHeight(64)
         self.display_label.mousePressEvent = self._on_display_label_mouse_press
-        self.root_layout.addWidget(self.display_label)
+        self.display_label.mouseMoveEvent = self._on_display_label_mouse_move
+        self.display_label.mouseReleaseEvent = self._on_display_label_mouse_release
+        self.card_layout.addWidget(self.display_label)
 
         self.spin_panel = QWidget()
         spin_layout = QHBoxLayout(self.spin_panel)
         spin_layout.setContentsMargins(0, 0, 0, 0)
-        spin_layout.setSpacing(8)
+        spin_layout.setSpacing(10)
         self.hour_spin = self._make_spin(0, 23, 0)
         self.minute_spin = self._make_spin(0, 59, 25)
         self.second_spin = self._make_spin(0, 59, 0)
         for label, spin in (("小时", self.hour_spin), ("分钟", self.minute_spin), ("秒", self.second_spin)):
-            box = QVBoxLayout()
+            field = QWidget()
+            box = QVBoxLayout(field)
+            box.setContentsMargins(0, 0, 0, 0)
+            box.setSpacing(4)
             title = QLabel(label)
             title.setObjectName("fieldLabel")
             title.setAlignment(Qt.AlignCenter)
             box.addWidget(title)
             box.addWidget(spin)
-            spin_layout.addLayout(box)
-        self.root_layout.addWidget(self.spin_panel)
+            spin_layout.addWidget(field, 1)
+        self.card_layout.addWidget(self.spin_panel)
 
         self.button_panel = QWidget()
         btn_layout = QHBoxLayout(self.button_panel)
@@ -1440,13 +1830,16 @@ class FocusTimerWindow(QWidget):
         btn_layout.addWidget(self.start_pause_btn)
         btn_layout.addWidget(self.reset_btn)
         btn_layout.addWidget(self.collapse_btn)
-        self.root_layout.addWidget(self.button_panel)
+        self.card_layout.addWidget(self.button_panel)
+        self.root_layout.addWidget(self.timer_card)
 
     def _make_spin(self, min_value, max_value, value):
         spin = QSpinBox()
         spin.setRange(min_value, max_value)
         spin.setValue(value)
         spin.setAlignment(Qt.AlignCenter)
+        spin.setFixedHeight(34)
+        spin.setButtonSymbols(QSpinBox.UpDownArrows)
         spin.valueChanged.connect(self.refresh_idle_display)
         return spin
 
@@ -1498,60 +1891,95 @@ class FocusTimerWindow(QWidget):
         self.is_collapsed = True
         self.spin_panel.hide()
         self.button_panel.hide()
-        self.root_layout.setContentsMargins(8, 8, 8, 8)
-        self.root_layout.setSpacing(0)
+        self.title_panel.hide()
+        self.root_layout.setContentsMargins(0, 0, 0, 0)
+        self.card_layout.setContentsMargins(8, 6, 8, 6)
+        self.card_layout.setSpacing(0)
         self.display_label.setCursor(Qt.PointingHandCursor)
+        self.display_label.setMinimumHeight(44)
+        self.display_label.setMaximumHeight(44)
         self.display_label.setStyleSheet("""
             QLabel#timerDisplay {
-                background: #07090D;
-                color: #F1EBDD;
-                border: 1px solid #9FB7CC;
-                border-radius: 8px;
+                background: transparent;
+                color: #EAE5F2;
                 font-size: 18px;
                 font-weight: 600;
-                padding: 10px;
+                padding: 0;
             }
         """)
-        self.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
-        self.resize(112, 58)
+        self.setMinimumSize(112, 56)
+        self.setMaximumSize(112, 56)
+        self.resize(112, 56)
         screen = QApplication.primaryScreen()
         if screen:
             rect = screen.availableGeometry()
             self.move(rect.right() - self.width() - 18, rect.top() + 18)
         self.show()
+        self.raise_()
         self.refresh_state()
 
     def expand_from_badge(self):
         if not self.is_collapsed:
             return
         self.is_collapsed = False
+        self.setMaximumSize(16777215, 16777215)
+        self.setMinimumSize(0, 0)
+        self.title_panel.show()
         self.spin_panel.show()
         self.button_panel.show()
-        self.root_layout.setContentsMargins(14, 14, 14, 14)
-        self.root_layout.setSpacing(12)
+        self.root_layout.setContentsMargins(10, 10, 10, 10)
+        self.card_layout.setContentsMargins(16, 12, 16, 14)
+        self.card_layout.setSpacing(8)
         self.display_label.setCursor(Qt.ArrowCursor)
+        self.display_label.setMinimumHeight(64)
+        self.display_label.setMaximumHeight(16777215)
         self.display_label.setStyleSheet("")
-        self.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
         if self._expanded_geometry:
             self.setGeometry(self._expanded_geometry)
         else:
-            self.resize(320, 220)
+            self.resize(320, 210)
         self.show()
-        apply_dark_window_chrome(self)
+        self.raise_()
+        self.activateWindow()
         self.refresh_state()
 
     def mousePressEvent(self, event):
         if self.is_collapsed and event.button() == Qt.LeftButton:
             self.expand_from_badge()
             return
+        if not self.is_collapsed and _begin_window_drag(self, event, max_y=84):
+            return
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if _continue_window_drag(self, event):
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        _end_window_drag(self)
+        super().mouseReleaseEvent(event)
 
     def _on_display_label_mouse_press(self, event):
         if self.is_collapsed and event.button() == Qt.LeftButton:
             self.expand_from_badge()
             event.accept()
             return
+        if not self.is_collapsed and event.button() == Qt.LeftButton:
+            self._dragging = True
+            self._drag_offset = event.globalPos() - self.frameGeometry().topLeft()
+            event.accept()
+            return
         QLabel.mousePressEvent(self.display_label, event)
+
+    def _on_display_label_mouse_move(self, event):
+        if _continue_window_drag(self, event):
+            return
+        QLabel.mouseMoveEvent(self.display_label, event)
+
+    def _on_display_label_mouse_release(self, event):
+        _end_window_drag(self)
+        QLabel.mouseReleaseEvent(self.display_label, event)
 
     def on_start_pause(self):
         if not self.pet:
@@ -1603,25 +2031,43 @@ class DesktopPet(QWidget):
         self.todo_window = None
         self.chat_window = None
         self.memory_window = None
+        self.learning_label_window = None
+        self.rss_manager_window = None
         self.focus_timer_window = None
         self.offset = QPoint()
         self.current_frame = 0
         self.is_happy = False
         self.happy_timer = 0
         self.proactive_care_thread = None
+        self.rss_recommend_thread = None
+        self.proactive_generation_seq = 0
         self.proactive_auto_enabled = True
         self.last_user_interaction_at = None
         self.last_proactive_at = None
         self.proactive_today = datetime.date.today()
         self.proactive_count_today = 0
         self.pending_proactive_messages = []
+        self.rss_recommend_today = datetime.date.today()
+        self.rss_recommend_count_today = 0
+        self.last_rss_recommend_at = None
         self.awaiting_proactive_reply = False
+        self.awaiting_proactive_reply_event_id = ""
+        self.awaiting_proactive_reply_since = None
+        self.last_proactive_silence_log_at = None
         self.focus_timer_end_at = None
         self.focus_timer_label = "专注"
         self.focus_timer_total_seconds = 0
         self.focus_timer_remaining_seconds = 0
         self.focus_timer_paused = False
         self.local_care_enabled = True
+        self.rsshub_starter_thread = None
+        self.todo_deadline_reminded = {}
+
+        try:
+            configure_local_rsshub_base()
+            self.rsshub_starter_thread = start_local_rsshub_background()
+        except Exception as e:
+            print(f"[RSSHub] 本地 RSSHub 启动调度失败：{e}")
         
         # 主动关怀：根据上下文低频发聊天消息，和本地生活提醒分开。
         self.chat_timer = QTimer(self)
@@ -1641,10 +2087,28 @@ class DesktopPet(QWidget):
         self.water_timer.timeout.connect(self.remind_drink_water)
         self.water_timer.start(1000 * 60 * 30)
 
+        self.todo_deadline_timer = QTimer(self)
+        self.todo_deadline_timer.timeout.connect(self.todo_deadline_tick)
+        self.todo_deadline_timer.start(1000 * 60 * 5)
+
+        rss_check_minutes = self._config_int("rss_recommender.background_check_minutes", 60, min_value=15, max_value=1440)
+        self.rss_content_timer = QTimer(self)
+        self.rss_content_timer.timeout.connect(self.rss_content_recommendation_tick)
+        self.rss_content_timer.start(1000 * 60 * rss_check_minutes)
+
+        rss_cleanup_hours = self._config_int("rss_recommender.cache_cleanup_interval_hours", 12, min_value=1, max_value=168)
+        self.rss_cleanup_timer = QTimer(self)
+        self.rss_cleanup_timer.timeout.connect(self.cleanup_rss_cache_tick)
+        self.rss_cleanup_timer.start(1000 * 60 * 60 * rss_cleanup_hours)
+
         self.init_ui()
         self.init_animation()
         self.check_special_day()
         self.schedule_startup_local_care()
+        QTimer.singleShot(1000 * 25, self.warmup_rss_content)
+        QTimer.singleShot(1000 * 45, self.cleanup_rss_cache_tick)
+        QTimer.singleShot(1000 * 90, self.rss_content_startup_recommendation_tick)
+        schedule_auto_label_batch(reason="startup_backlog", delay_seconds=60)
 
     def init_ui(self):
         self.setWindowFlags(
@@ -1670,13 +2134,13 @@ class DesktopPet(QWidget):
         self.bubble.setWordWrap(True)
         self.bubble.setStyleSheet("""
             QLabel {
-                background-color: rgba(5, 6, 7, 238);
-                border: 1px solid #6F879B;
-                border-radius: 8px;
-                padding: 5px 25px 5px 10px;
-                font-size: 12px;
-                color: #F1EBDD;
-                font-family: "Microsoft YaHei";
+                background-color: rgba(17, 17, 27, 238);
+                border: 1px solid #B886F8;
+                border-radius: 16px;
+                padding: 6px 25px 6px 12px;
+                font-size: 13px;
+                color: #EAE5F2;
+                font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;
             }
         """)
         self.bubble.setGeometry(0, 0, 180, 50)
@@ -1687,13 +2151,13 @@ class DesktopPet(QWidget):
         self.close_bubble_btn.setStyleSheet("""
             QPushButton {
                 background-color: transparent;
-                color: #9FB7CC;
+                color: #B886F8;
                 border: none;
                 font-size: 12px;
                 font-weight: bold;
             }
             QPushButton:hover {
-                color: #F1EBDD;
+                color: #EAE5F2;
             }
         """)
         self.close_bubble_btn.clicked.connect(self.hide_bubble)
@@ -1714,12 +2178,12 @@ class DesktopPet(QWidget):
         self.focus_timer_badge.setStyleSheet("""
             QLabel {
                 background-color: rgba(7, 9, 13, 238);
-                border: 1px solid #6F879B;
-                border-radius: 8px;
-                color: #F1EBDD;
+                border: 1px solid #4E3C6B;
+                border-radius: 16px;
+                color: #EAE5F2;
                 font-size: 12px;
                 font-weight: bold;
-                font-family: "Microsoft YaHei";
+                font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;
             }
         """)
         self.focus_timer_badge.hide()
@@ -1867,37 +2331,209 @@ class DesktopPet(QWidget):
                 self.pet_movie.start()
 
     def observe_user_message(self, text):
+        if self.awaiting_proactive_reply and self.awaiting_proactive_reply_event_id:
+            try:
+                event_id = self.awaiting_proactive_reply_event_id
+                replied_after = None
+                if self.awaiting_proactive_reply_since:
+                    replied_after = int(
+                        (datetime.datetime.now() - self.awaiting_proactive_reply_since).total_seconds()
+                    )
+                log_feedback_event(
+                    event_id=event_id,
+                    feedback_value=1,
+                    feedback_scope="proactive_user_replied",
+                    user_text=text,
+                    assistant_text="",
+                    extra={"user_replied_after_sec": replied_after},
+                )
+                schedule_auto_relabel_event(event_id, reason="proactive_user_replied")
+            except Exception as e:
+                print(f"[LearningLog] 主动关怀隐式反馈写入失败: {e}")
         self.last_user_interaction_at = datetime.datetime.now()
         self.awaiting_proactive_reply = False
+        self.awaiting_proactive_reply_event_id = ""
+        self.awaiting_proactive_reply_since = None
         QTimer.singleShot(1000 * 60 * 12, self.proactive_companion_tick)
+
+    def _learning_app_state_snapshot(self):
+        now = datetime.datetime.now()
+        def _minutes_since(value):
+            if not value:
+                return None
+            try:
+                return round(max(0, (now - value).total_seconds()) / 60, 2)
+            except Exception:
+                return None
+        return {
+            "chat_visible": bool(self.chat_window is not None and self.chat_window.isVisible()),
+            "bubble_visible": bool(getattr(self, "bubble_container", None) and self.bubble_container.isVisible()),
+            "pending_proactive_count": len(self.pending_proactive_messages),
+            "awaiting_proactive_reply": bool(self.awaiting_proactive_reply),
+            "proactive_count_today": int(self.proactive_count_today),
+            "proactive_daily_limit": 10,
+            "minutes_since_last_proactive": _minutes_since(self.last_proactive_at),
+            "minutes_since_last_user_interaction": _minutes_since(self.last_user_interaction_at),
+            "focus_timer_running": bool(self.focus_timer_end_at and not self.focus_timer_paused),
+            "focus_timer_remaining_seconds": int(self.focus_timer_remaining_seconds or 0),
+            "local_care_enabled": bool(self.local_care_enabled),
+        }
+
+    def _learning_observation_delay_seconds(self):
+        try:
+            value = int(app_config.get("learning_labeler.observation_window_seconds", 900))
+        except Exception:
+            value = 900
+        return max(60, min(value, 60 * 60))
+
+    def _record_learning_state_observation(self, event_id, assistant_text="", scope="implicit_state_observation", delay_seconds=None, extra=None):
+        event_id = str(event_id or "").strip()
+        if not event_id:
+            return
+        try:
+            payload = dict(extra or {})
+            if scope == "proactive_followup_state":
+                payload["user_replied_before_observation"] = not (
+                    self.awaiting_proactive_reply
+                    and self.awaiting_proactive_reply_event_id == event_id
+                )
+            system_state = collect_system_state(extra=self._learning_app_state_snapshot())
+            log_implicit_state_observation(
+                event_id=event_id,
+                scope=scope,
+                feedback_value=0,
+                assistant_text=assistant_text,
+                system_state=system_state,
+                delay_seconds=delay_seconds,
+                extra=payload,
+            )
+            schedule_auto_relabel_event(event_id, reason=scope)
+        except Exception as e:
+            print(f"[LearningLog] implicit state observation failed: {e}")
+
+    def _schedule_learning_state_observation(self, event_id, assistant_text="", scope="implicit_state_observation", extra=None):
+        event_id = str(event_id or "").strip()
+        if not event_id:
+            return
+        delay_seconds = self._learning_observation_delay_seconds()
+        QTimer.singleShot(
+            delay_seconds * 1000,
+            lambda eid=event_id, text=assistant_text, sc=scope, ds=delay_seconds, ex=dict(extra or {}):
+                self._record_learning_state_observation(
+                    eid,
+                    assistant_text=text,
+                    scope=sc,
+                    delay_seconds=ds,
+                    extra=ex,
+                )
+        )
+
+    def _log_proactive_learning_event(self, *, text="", state="idle", selected_strategy="proactive_checkin", reason=""):
+        try:
+            try:
+                recent_turns = conversation_history.get_turns()
+            except Exception:
+                recent_turns = []
+            try:
+                profile_snapshot = get_user_profile_prompt_context()
+            except Exception:
+                profile_snapshot = "无"
+            event = build_interaction_event(
+                user_text="[PROACTIVE_TRIGGER]",
+                assistant_text=text,
+                trigger_type="proactive_timer",
+                trigger_source=state or "proactive",
+                recent_turns=recent_turns,
+                user_profile_snapshot=profile_snapshot,
+                system_state_snapshot=collect_system_state(extra=self._learning_app_state_snapshot()),
+                current_response_card=f"主动关怀触发；策略={selected_strategy}；原因={reason}",
+                models={"proactive": app_config.get("ark.model_main", "") or "doubao-1-5-pro-32k-250115"},
+            )
+            event["strategy"]["selected"] = selected_strategy
+            event["strategy"]["reason"] = reason
+            event["strategy"]["recommendation_used"] = False
+            log_interaction_event(event, enqueue_label=True)
+            schedule_auto_label_batch(reason="proactive_event")
+            return event
+        except Exception as e:
+            print(f"[LearningLog] 主动关怀样本写入失败: {e}")
+            return {}
+
+    def _maybe_log_proactive_silence(self, reason):
+        now = datetime.datetime.now()
+        if (
+            self.last_proactive_silence_log_at
+            and (now - self.last_proactive_silence_log_at).total_seconds() < 60 * 60
+        ):
+            return
+        self.last_proactive_silence_log_at = now
+        self._log_proactive_learning_event(
+            text="",
+            state="proactive_silence",
+            selected_strategy="do_nothing",
+            reason=reason,
+        )
 
     def proactive_companion_tick(self):
         if not self.proactive_auto_enabled:
             return
         now = datetime.datetime.now()
         if 1 <= now.hour < 7:
+            self._maybe_log_proactive_silence("night_quiet_hours")
             return
         if self.proactive_today != now.date():
             self.proactive_today = now.date()
             self.proactive_count_today = 0
         if self.proactive_count_today >= 10:
+            self._maybe_log_proactive_silence("daily_limit_reached")
             return
         if self.awaiting_proactive_reply or self.pending_proactive_messages:
+            self._maybe_log_proactive_silence("waiting_for_user_after_previous_proactive")
             return
         if self.last_proactive_at and (now - self.last_proactive_at).total_seconds() < 45 * 60:
+            self._maybe_log_proactive_silence("cooldown")
             return
         if self.proactive_care_thread is not None and self.proactive_care_thread.isRunning():
+            self._maybe_log_proactive_silence("generation_already_running")
             return
-        self.proactive_care_thread = ProactiveCareThread()
+        self.proactive_generation_seq += 1
+        self.proactive_care_thread = ProactiveCareThread(
+            generation_id=self.proactive_generation_seq,
+            started_at=now,
+            last_user_interaction_at=self.last_user_interaction_at,
+            pending_count=len(self.pending_proactive_messages),
+            awaiting_reply=bool(self.awaiting_proactive_reply),
+        )
         self.proactive_care_thread.finished_signal.connect(self.on_proactive_care_generated)
         self.proactive_care_thread.error_signal.connect(self.on_proactive_care_error)
         self.proactive_care_thread.start()
 
     def on_proactive_care_generated(self, text):
+        thread = self.sender()
+        if thread is not self.proactive_care_thread:
+            print("[Proactive] 丢弃旧主动关怀：生成线程已不是当前线程")
+            return
+        if not self._is_proactive_generation_fresh(thread):
+            print("[Proactive] 丢弃旧主动关怀：生成期间用户状态已变化")
+            return
         text = str(text or "").strip()
         if not text:
             return
         self.send_proactive_message(text, state="llm_context")
+
+    def _is_proactive_generation_fresh(self, thread):
+        if not thread:
+            return False
+        if getattr(thread, "generation_id", None) != self.proactive_generation_seq:
+            return False
+        started_at = getattr(thread, "started_at", None)
+        if self.last_user_interaction_at and started_at and self.last_user_interaction_at >= started_at:
+            return False
+        if len(self.pending_proactive_messages) != getattr(thread, "pending_count", 0):
+            return False
+        if bool(self.awaiting_proactive_reply) != bool(getattr(thread, "awaiting_reply", False)):
+            return False
+        return True
 
     def on_proactive_care_error(self, error):
         print(f"[Proactive] 主动关怀生成失败: {error}")
@@ -1920,11 +2556,208 @@ class DesktopPet(QWidget):
         ]
         self.show_local_care_bubble(random.choice(messages), duration=6000)
 
+    @staticmethod
+    def _parse_todo_due_datetime(raw):
+        text = str(raw or "").strip()
+        if not text or "无" in text or text.lower() in {"none", "null"}:
+            return None
+        text = text.replace("/", "-").replace("T", " ")
+        text = re.sub(r"\s+", " ", text)
+        date_only = re.fullmatch(r"\d{4}-\d{1,2}-\d{1,2}", text)
+        if date_only:
+            try:
+                return datetime.datetime.strptime(text, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+            except Exception:
+                return None
+        match = re.search(r"(\d{4}-\d{1,2}-\d{1,2})\s+(\d{1,2}:\d{1,2}(?::\d{1,2})?)", text)
+        if match:
+            text = f"{match.group(1)} {match.group(2)}"
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+            try:
+                return datetime.datetime.strptime(text, fmt)
+            except Exception:
+                pass
+        return None
+
+    @staticmethod
+    def _todo_deadline_tier(seconds_left):
+        if seconds_left < -10 * 60:
+            return "overdue"
+        if 0 <= seconds_left <= 60 * 60:
+            return "1h"
+        if 0 <= seconds_left <= 6 * 60 * 60:
+            return "6h"
+        if 0 <= seconds_left <= 24 * 60 * 60:
+            return "24h"
+        return ""
+
+    @staticmethod
+    def _format_deadline_left(seconds_left):
+        if seconds_left < 0:
+            minutes = int(abs(seconds_left) // 60)
+            if minutes < 60:
+                return f"已经过了 {minutes} 分钟"
+            hours = minutes // 60
+            return f"已经过了 {hours} 小时"
+        minutes = int(max(1, seconds_left // 60))
+        if minutes < 60:
+            return f"还剩 {minutes} 分钟"
+        hours = minutes // 60
+        if hours < 24:
+            return f"还剩 {hours} 小时"
+        days = hours // 24
+        return f"还剩 {days} 天"
+
+    def todo_deadline_tick(self):
+        if not getattr(self, "local_care_enabled", True):
+            return
+        if hasattr(self, "bubble_container") and self.bubble_container.isVisible():
+            return
+        try:
+            items = todo_store().all()
+        except Exception as e:
+            print(f"[TodoReminder] 读取待办失败: {e}")
+            return
+        now = datetime.datetime.now()
+        candidates = []
+        active_ids = set()
+        for item in items:
+            if not isinstance(item, dict) or item.get("completed"):
+                continue
+            todo_id = str(item.get("id") or "")
+            active_ids.add(todo_id)
+            due_at = self._parse_todo_due_datetime(item.get("endtime"))
+            if not due_at:
+                continue
+            seconds_left = (due_at - now).total_seconds()
+            tier = self._todo_deadline_tier(seconds_left)
+            if not tier:
+                continue
+            if self.todo_deadline_reminded.get(todo_id) == tier:
+                continue
+            candidates.append((seconds_left, tier, item, due_at))
+
+        for todo_id in list(self.todo_deadline_reminded):
+            if todo_id not in active_ids:
+                self.todo_deadline_reminded.pop(todo_id, None)
+
+        if not candidates:
+            return
+        candidates.sort(key=lambda row: row[0])
+        seconds_left, tier, item, due_at = candidates[0]
+        text = str(item.get("text") or "有一条待办").strip()
+        if len(text) > 34:
+            text = text[:34] + "..."
+        left = self._format_deadline_left(seconds_left)
+        if tier == "overdue":
+            bubble = f"待办过截止时间了：{text}。\n{left}，别忘了处理。"
+        else:
+            bubble = f"待办快截止了：{text}。\n{left}，截止 {due_at.strftime('%m-%d %H:%M')}。"
+        self.todo_deadline_reminded[str(item.get("id") or "")] = tier
+        self.show_local_care_bubble(bubble, duration=8000)
+
     def schedule_startup_local_care(self):
         QTimer.singleShot(1000 * 20, self.startup_local_care_tick)
         QTimer.singleShot(1000 * 60 * 30, self.remind_drink_water)
         QTimer.singleShot(1000 * 60 * 45, self.remind_stand_up)
         QTimer.singleShot(1000 * 60 * 3, self.proactive_companion_tick)
+
+    def warmup_rss_content(self):
+        try:
+            rss_content_runtime.warmup()
+        except Exception as e:
+            print("[RSS] warmup failed:", e)
+
+    def cleanup_rss_cache_tick(self):
+        try:
+            rss_content_runtime.cleanup_cache(force=False)
+        except Exception as e:
+            print("[RSS] cache cleanup failed:", e)
+
+    @staticmethod
+    def _config_bool(key, default=False):
+        value = app_config.get(key, default)
+        if value is None or value == "":
+            return bool(default)
+        return str(value).strip().lower() not in {"0", "false", "no", "off"}
+
+    @staticmethod
+    def _config_int(key, default, min_value=0, max_value=None):
+        try:
+            value = int(app_config.get(key, default))
+        except Exception:
+            value = int(default)
+        value = max(int(min_value), value)
+        if max_value is not None:
+            value = min(int(max_value), value)
+        return value
+
+    def rss_content_startup_recommendation_tick(self):
+        self.rss_content_recommendation_tick(trigger_type="startup")
+
+    def _rss_recommendation_allowed(self, trigger_type):
+        if not self._config_bool("rss_recommender.enabled", True):
+            return False, "rss_disabled"
+        if trigger_type == "startup" and not self._config_bool("rss_recommender.startup_recommend_enabled", True):
+            return False, "startup_recommend_disabled"
+        if trigger_type != "startup" and not self._config_bool("rss_recommender.idle_recommend_enabled", True):
+            return False, "idle_recommend_disabled"
+
+        now = datetime.datetime.now()
+        if self.rss_recommend_today != now.date():
+            self.rss_recommend_today = now.date()
+            self.rss_recommend_count_today = 0
+        daily_limit = self._config_int("rss_recommender.active_recommend_daily_limit", 2, min_value=0, max_value=10)
+        if daily_limit <= 0 or self.rss_recommend_count_today >= daily_limit:
+            return False, "daily_limit"
+        cooldown_hours = self._config_int("rss_recommender.active_recommend_cooldown_hours", 8, min_value=1, max_value=72)
+        if self.last_rss_recommend_at and (now - self.last_rss_recommend_at).total_seconds() < cooldown_hours * 3600:
+            return False, "cooldown"
+        if self.awaiting_proactive_reply or self.pending_proactive_messages:
+            return False, "waiting_for_user_after_previous_proactive"
+        if self.rss_recommend_thread is not None and self.rss_recommend_thread.isRunning():
+            return False, "rss_recommend_running"
+        if self.proactive_care_thread is not None and self.proactive_care_thread.isRunning():
+            return False, "proactive_generation_running"
+        if trigger_type != "startup":
+            try:
+                state = collect_system_state()
+                idle = state.get("idle") or {}
+                if not bool(idle.get("is_idle")):
+                    return False, "not_idle"
+            except Exception:
+                return False, "idle_state_unavailable"
+        return True, "ok"
+
+    def rss_content_recommendation_tick(self, trigger_type="proactive_timer"):
+        allowed, reason = self._rss_recommendation_allowed(trigger_type)
+        if not allowed:
+            print(f"[RSS] skip proactive content recommendation: {reason}")
+            return
+        self.rss_recommend_thread = RSSContentRecommendThread(trigger_type=trigger_type)
+        self.rss_recommend_thread.finished_signal.connect(self.on_rss_content_recommended)
+        self.rss_recommend_thread.error_signal.connect(self.on_rss_content_recommend_error)
+        self.rss_recommend_thread.start()
+
+    def on_rss_content_recommended(self, payload):
+        payload = payload or {}
+        message = str(payload.get("message") or "").strip()
+        decision = payload.get("decision") or {}
+        if not message:
+            print(f"[RSS] no proactive content recommendation: {decision.get('reason', '')}")
+            return
+        self.last_rss_recommend_at = datetime.datetime.now()
+        self.rss_recommend_count_today += 1
+        self.send_proactive_message(
+            message,
+            state="rss_content_recommendation",
+            selected_strategy="external_content_recommendation",
+            reason="rss_background_recommendation",
+            external_content_decision=decision,
+        )
+
+    def on_rss_content_recommend_error(self, error):
+        print(f"[RSS] proactive content recommendation failed: {error}")
 
     def startup_local_care_tick(self):
         self.show_local_care_bubble("我在。水放近一点，别一直盯着屏幕。", duration=6000)
@@ -1942,21 +2775,53 @@ class DesktopPet(QWidget):
         self.show_bubble(text, duration=duration)
         return True
 
-    def send_proactive_message(self, text, state="idle"):
+    def send_proactive_message(
+            self, text, state="idle", selected_strategy="proactive_context_checkin",
+            reason="llm_generated_active_care", external_content_decision=None):
         if not text:
             return
         self.last_proactive_at = datetime.datetime.now()
         self.proactive_count_today += 1
         self.awaiting_proactive_reply = True
+        self.awaiting_proactive_reply_since = self.last_proactive_at
+        learning_event = self._log_proactive_learning_event(
+            text=text,
+            state=state,
+            selected_strategy=selected_strategy,
+            reason=reason,
+        )
+        self.awaiting_proactive_reply_event_id = learning_event.get("event_id", "")
+        if self.awaiting_proactive_reply_event_id:
+            self._schedule_learning_state_observation(
+                self.awaiting_proactive_reply_event_id,
+                assistant_text=text,
+                scope="proactive_followup_state",
+                extra={
+                    "proactive_state": state,
+                    "user_replied_before_observation": False,
+                    "pending_reply_event_id": self.awaiting_proactive_reply_event_id,
+                },
+            )
         try:
-            conversation_history.add_turn("", text)
+            conversation_history.add_turn("", text, source="proactive")
         except Exception as e:
             print(f"[Proactive] 写入对话历史失败: {e}")
-        self.pending_proactive_messages.append({"text": text, "state": state, "time": self.last_proactive_at.isoformat()})
+        self.pending_proactive_messages.append({
+            "text": text,
+            "state": state,
+            "time": self.last_proactive_at.isoformat(),
+            "learning_event": learning_event,
+            "external_content_decision": external_content_decision or {},
+        })
         if self.chat_window is not None and self.chat_window.isVisible():
             old_feedback_context = getattr(self.chat_window, "last_user_message_for_feedback", "")
             self.chat_window.last_user_message_for_feedback = "[主动陪伴消息]"
-            self.chat_window.add_message(text, is_user=False)
+            self.chat_window.add_message(
+                text,
+                is_user=False,
+                learning_event=learning_event,
+                external_content_decision=external_content_decision or {},
+            )
             self.chat_window.last_user_message_for_feedback = old_feedback_context
             self.pending_proactive_messages.clear()
         if not self.bubble_container.isVisible():
@@ -1968,7 +2833,27 @@ class DesktopPet(QWidget):
         for msg in self.pending_proactive_messages:
             old_feedback_context = getattr(self.chat_window, "last_user_message_for_feedback", "")
             self.chat_window.last_user_message_for_feedback = "[主动陪伴消息]"
-            self.chat_window.add_message(msg.get("text", ""), is_user=False)
+            learning_event = msg.get("learning_event") or {}
+            self.chat_window.add_message(
+                msg.get("text", ""),
+                is_user=False,
+                learning_event=learning_event,
+                external_content_decision=msg.get("external_content_decision") or {},
+            )
+            if learning_event.get("event_id"):
+                try:
+                    event_id = learning_event.get("event_id", "")
+                    log_feedback_event(
+                        event_id=event_id,
+                        feedback_value=1,
+                        feedback_scope="proactive_chat_opened",
+                        user_text="[OPEN_CHAT_AFTER_PROACTIVE]",
+                        assistant_text=msg.get("text", ""),
+                        extra={"proactive_state": msg.get("state", "")},
+                    )
+                    schedule_auto_relabel_event(event_id, reason="proactive_chat_opened")
+                except Exception as e:
+                    print(f"[LearningLog] 主动关怀打开聊天反馈写入失败: {e}")
             self.chat_window.last_user_message_for_feedback = old_feedback_context
         self.pending_proactive_messages.clear()
 
@@ -1998,7 +2883,16 @@ class DesktopPet(QWidget):
         self.bubble.setGeometry(0, 0, 180, height)
         self.bubble.setText("")
         
+        self.bubble_container.setWindowOpacity(0.0)
         self.bubble_container.show()
+        
+        # 气泡弹出动画
+        self.bubble_anim = QPropertyAnimation(self.bubble_container, b"windowOpacity")
+        self.bubble_anim.setDuration(250)
+        self.bubble_anim.setStartValue(0.0)
+        self.bubble_anim.setEndValue(1.0)
+        self.bubble_anim.start()
+        
         if getattr(self, "focus_timer_badge", None) is not None and self.focus_timer_badge.isVisible():
             self.focus_timer_badge.raise_()
         
@@ -2019,7 +2913,14 @@ class DesktopPet(QWidget):
     def hide_bubble(self):
         self.typewriter_timer.stop()
         self.bubble_hide_timer.stop()
-        self.bubble_container.hide()
+        
+        # 气泡消失动画
+        self.bubble_anim = QPropertyAnimation(self.bubble_container, b"windowOpacity")
+        self.bubble_anim.setDuration(300)
+        self.bubble_anim.setStartValue(1.0)
+        self.bubble_anim.setEndValue(0.0)
+        self.bubble_anim.finished.connect(self.bubble_container.hide)
+        self.bubble_anim.start()
 
     def is_focus_timer_active(self):
         return bool(self.focus_timer_end_at or self.focus_timer_paused)
@@ -2147,25 +3048,25 @@ class DesktopPet(QWidget):
         menu = QMenu(self)
         menu.setStyleSheet("""
             QMenu {
-                background-color: #050607;
-                color: #F1EBDD;
-                border: 1px solid #46586B;
-                border-radius: 8px;
+                background-color: #1A1525;
+                color: #EAE5F2;
+                border: 1px solid #3D2E55;
+                border-radius: 16px;
                 padding: 6px;
                 font-size: 13px;
             }
             QMenu::item {
                 padding: 8px 24px;
-                border-radius: 6px;
+                border-radius: 16px;
                 background: transparent;
             }
             QMenu::item:selected {
-                background-color: #20162E;
-                color: #F1EBDD;
+                background-color: #3D2E55;
+                color: #EAE5F2;
             }
             QMenu::separator {
                 height: 1px;
-                background: #273546;
+                background: #3D2E55;
                 margin: 6px 8px;
             }
         """)
@@ -2175,6 +3076,8 @@ class DesktopPet(QWidget):
         focus_timer_action = menu.addAction("专注定时器")
         cancel_timer_action = menu.addAction("取消专注定时")
         memory_action = menu.addAction("记忆管理")
+        rss_action = menu.addAction("RSS 管理")
+        learning_label_action = menu.addAction("训练样本标注")
         kb_action = menu.addAction("添加知识库")
         pet_action = menu.addAction("摸摸我")
         menu.addSeparator()
@@ -2193,6 +3096,10 @@ class DesktopPet(QWidget):
             self.cancel_focus_timer()
         elif action == memory_action:
             self.open_memory_manager()
+        elif action == rss_action:
+            self.open_rss_manager()
+        elif action == learning_label_action:
+            self.open_learning_label_window()
         elif action == kb_action:
             self.add_to_knowledge_base()
         elif action == pet_action:
@@ -2302,6 +3209,33 @@ class DesktopPet(QWidget):
             self.memory_window.refresh()
             self.memory_window.activateWindow()
 
+    def open_learning_label_window(self):
+        if self.learning_label_window is None or not self.learning_label_window.isVisible():
+            self.learning_label_window = LearningLabelWindow()
+            screen = QDesktopWidget().screenGeometry()
+            size = self.learning_label_window.geometry()
+            x = (screen.width() - size.width()) // 2
+            y = (screen.height() - size.height()) // 2
+            self.learning_label_window.move(x, y)
+            self.learning_label_window.show()
+        else:
+            self.learning_label_window.reload()
+            self.learning_label_window.activateWindow()
+
+    def open_rss_manager(self):
+        if self.rss_manager_window is None or not self.rss_manager_window.isVisible():
+            self.rss_manager_window = RSSManagerWindow()
+            screen = QDesktopWidget().screenGeometry()
+            size = self.rss_manager_window.geometry()
+            x = (screen.width() - size.width()) // 2
+            y = (screen.height() - size.height()) // 2
+            self.rss_manager_window.move(x, y)
+            self.rss_manager_window.show()
+        else:
+            self.rss_manager_window.reload_sources()
+            self.rss_manager_window.reload_items()
+            self.rss_manager_window.activateWindow()
+
 
 # ==================== 远程图片下载线程 ====================
 class ImageDownloader(QThread):
@@ -2339,9 +3273,72 @@ class COSSyncThread(QThread):
         self.finished_signal.emit(success, msg)
 
 
+class RSSContentRecommendThread(QThread):
+    finished_signal = pyqtSignal(object)
+    error_signal = pyqtSignal(str)
+
+    def __init__(self, trigger_type="proactive_timer"):
+        super().__init__()
+        self.trigger_type = str(trigger_type or "proactive_timer")
+
+    @staticmethod
+    def _recent_context():
+        try:
+            turns = conversation_history.get_turns()
+        except Exception:
+            turns = []
+        now = datetime.datetime.now()
+        records = []
+        for turn in list(turns or [])[-8:]:
+            if not isinstance(turn, dict):
+                continue
+            minutes_ago = None
+            try:
+                ts = turn.get("timestamp") or ""
+                if ts:
+                    minutes_ago = round(max(0, (now - datetime.datetime.fromisoformat(str(ts))).total_seconds()) / 60, 2)
+            except Exception:
+                minutes_ago = None
+            records.append({
+                "role_pair": "proactive_message" if not turn.get("user") else "user_assistant",
+                "user": str(turn.get("user") or ""),
+                "assistant_summary": str(turn.get("assistant_summary") or turn.get("assistant") or "")[:180],
+                "timestamp": turn.get("timestamp") or "",
+                "minutes_ago": minutes_ago,
+            })
+        return records
+
+    def run(self):
+        try:
+            try:
+                profile_context = get_user_profile_prompt_context()
+            except Exception:
+                profile_context = ""
+            decision = rss_content_runtime.suggest(
+                user_text="",
+                user_profile=str(profile_context or ""),
+                recent_context=self._recent_context(),
+                strategy_prediction={},
+                trigger_type=self.trigger_type,
+                allow_refresh=True,
+            )
+            message = format_external_content_recommendation_message(decision)
+            self.finished_signal.emit({"decision": decision, "message": message})
+        except Exception as e:
+            self.error_signal.emit(str(e))
+
+
 class ProactiveCareThread(QThread):
     finished_signal = pyqtSignal(str)
     error_signal = pyqtSignal(str)
+
+    def __init__(self, generation_id=0, started_at=None, last_user_interaction_at=None, pending_count=0, awaiting_reply=False):
+        super().__init__()
+        self.generation_id = generation_id
+        self.started_at = started_at or datetime.datetime.now()
+        self.last_user_interaction_at = last_user_interaction_at
+        self.pending_count = int(pending_count or 0)
+        self.awaiting_reply = bool(awaiting_reply)
 
     def run(self):
         try:
@@ -2366,6 +3363,18 @@ class ProactiveCareThread(QThread):
             except Exception:
                 profile_context = "无"
             profile_context = str(profile_context or "无")[:900]
+            try:
+                runtime_state = collect_system_state()
+            except Exception:
+                runtime_state = {}
+            foreground = (runtime_state.get("foreground") or {})
+            idle = (runtime_state.get("idle") or {})
+            system_state_context = (
+                f"前台应用类别={foreground.get('category', 'unknown')}；"
+                f"前台应用连续时长={foreground.get('active_duration_bucket', 'unknown')}；"
+                f"空闲时长={idle.get('seconds_bucket', 'unknown')}；"
+                f"是否空闲={idle.get('is_idle', False)}。"
+            )
 
             prompt = f"""现在时间是{now.year}年{now.month}月{now.day}日{now.hour}时{now.minute}分。
 
@@ -2382,10 +3391,19 @@ class ProactiveCareThread(QThread):
 3. 不要把昨天或几小时前的事情当成正在发生。
 4. 如果用户之前说在学习/写代码/复习，且时间仍新鲜，可以问“学得怎么样/代码写得怎么样”；如果太久了，就泛泛问现在在做什么。
 
+主动关怀去重：
+1. 最近主动关怀记录只是为了让你知道自己刚说过什么，不能当成可模仿的写作样本。
+2. 不要连续使用同一种开头、同一种追问方式、同一种“别硬撑/别放空”式提醒。
+3. 如果最近已经围绕同一件事关心过，换一个更轻的角度，或者只做普通生活提醒。
+
 语气要求：必须像久远寺有珠本人在聊天。简短、克制、略带冷淡关心，可以轻微责备；不要热情客服腔。15到45个汉字，不要表情标签，不要解释。
 
 用户画像摘要：
 {profile_context}
+
+本地状态粗略信号：
+{system_state_context}
+这些只是程序本地粗粒度状态，不代表你真的看见用户或能监督用户；可以用来判断是否少打扰、是否泛泛问候。
 
 最近上下文：
 {context_text}
@@ -2406,8 +3424,12 @@ class ProactiveCareThread(QThread):
             )
             raw = (response.choices[0].message.content or "").strip()
             message = clean_proactive_message(raw)
+            if is_repetitive_proactive_message(message, history_turns, now=now):
+                print("[Proactive] 主动关怀与近期内容过于相似，跳过本次发送")
+                message = ""
             if not message:
-                message = "在干嘛？别把自己晾得太久。"
+                self.finished_signal.emit("")
+                return
             self.finished_signal.emit(message)
         except Exception as e:
             self.error_signal.emit(str(e))
@@ -2415,7 +3437,7 @@ class ProactiveCareThread(QThread):
 
 # ==================== LLM 请求线程 ====================
 class LLMFetcherThread(QThread):
-    finished_signal = pyqtSignal(str)
+    finished_signal = pyqtSignal(str, object)
     error_signal = pyqtSignal(str)
 
     def __init__(self, user_text, image_path=None):
@@ -2435,6 +3457,7 @@ class LLMFetcherThread(QThread):
 
         persist_executor = None
         mem_write_future = None
+        learning_event = None
         now = datetime.datetime.now()
         year=now.year
         month=now.month
@@ -2454,6 +3477,8 @@ class LLMFetcherThread(QThread):
                 openai_api_base=base_url,
                 max_tokens=256,        # 原来是 2048，输出只有两行根本用不上
                 temperature=0.3,       # 关键词/事实抽取用更确定的温度
+                timeout=20,
+                max_retries=0,
                 model_kwargs={
                     "extra_body": {"thinking": {"type": "disabled"}}
                 }
@@ -2505,7 +3530,7 @@ class LLMFetcherThread(QThread):
             lap(f"记忆召回（与提取器并行） matched={len(matched_memories)}")
             executor.shutdown(wait=False)
 
-            # ===== 3. 立刻在后台开始写新记忆（与下面的 KB 召回 + 主回复 LLM 并行） =====
+            # ===== 3. 立刻在后台开始写新记忆（与下面的工具准备 + 主回复 LLM 并行） =====
             # 关键：写完才能 emit，确保用户下一轮一定能查到。chroma_add 通常 1-3s，会被主回复 LLM 全部覆盖掉。
             if new_fact and new_fact != "无":
                 def _persist_memory_sync(fact, kws):
@@ -2627,36 +3652,114 @@ class LLMFetcherThread(QThread):
                     _persist_memory_sync, new_fact, list(search_keywords)
                 )
 
-            # ===== 4. SoulState + 知识库召回 =====
+            # ===== 4. SoulState + 可选知识库工具 =====
             soul_state.resonate(matched_memories)
             rag_params = soul_state.get_params()
 
             memory_context_str = "无"
-            knowledge_context_str = "无"
+            knowledge_context_str = "本轮未调用知识库工具。"
+            has_attachment = bool(self.image_path and os.path.exists(self.image_path))
             if matched_memories:
                 limit = rag_params["memory_limit"]
                 memory_context_str = "\n".join(f"- {m}" for m in matched_memories[:limit])
 
-            kb_results = knowledge_base.search(self.user_text, keywords=search_keywords, top_k=rag_params["top_k"])
-            if kb_results:
-                knowledge_context_str = "\n".join(f"- {k}" for k in kb_results)
-            lap(f"知识库召回 kb={len(kb_results)}")
+            kb_route = should_search_knowledge_base(self.user_text, has_attachment=has_attachment)
+            kb_results = []
+            if kb_route.get("used"):
+                try:
+                    kb_results = knowledge_base.search(
+                        kb_route.get("query") or self.user_text,
+                        keywords=search_keywords,
+                        top_k=min(3, int(rag_params["top_k"])),
+                    )
+                except Exception as kb_e:
+                    print("[KB Tool] 知识库工具检索失败:", kb_e)
+                    kb_results = []
+                if kb_results:
+                    knowledge_context_str = "\n".join(f"- {k}" for k in kb_results)
+                else:
+                    knowledge_context_str = "已调用知识库工具，但没有检索到足够相关的资料。"
+                lap(f"知识库工具 used kb={len(kb_results)}")
+            else:
+                knowledge_context_str = f"本轮未调用知识库工具：{kb_route.get('reason', '未触发')}。"
+                lap(f"知识库工具 skipped mode={kb_route.get('mode')}")
 
             # ===== 4. 组装主回复 prompt =====
             categories_str = "\n".join([f"- {k}: {v}" for k, v in DEFAULT_CATEGORY_DESCRIPTIONS.items()])
             # 把本地保存的最近 N 轮对话（不含本轮）一并打包进 prompt，给模型短期上下文
+            try:
+                recent_turns_for_learning = conversation_history.get_turns()
+            except Exception:
+                recent_turns_for_learning = []
             recent_context_str = conversation_history.format_for_prompt()
-            has_attachment = bool(self.image_path and os.path.exists(self.image_path))
-            current_response_card_str = build_current_response_card(
-                self.user_text,
-                has_attachment=has_attachment,
-                local_prediction=None,
-            )
             try:
                 user_profile_context_str = get_user_profile_prompt_context()
             except Exception as profile_e:
                 print("[Pet][prompt] 用户画像上下文读取失败:", profile_e)
                 user_profile_context_str = "无"
+            try:
+                runtime_state_snapshot = collect_system_state()
+            except Exception as state_e:
+                print("[Pet][prompt] 本地状态读取失败:", state_e)
+                runtime_state_snapshot = {}
+            try:
+                local_strategy_prediction = strategy_predictor_runtime.predict(
+                    user_text=self.user_text,
+                    recent_context=recent_turns_for_learning,
+                    user_profile=user_profile_context_str,
+                    system_state=runtime_state_snapshot,
+                    matched_memories=matched_memories,
+                    trigger_type="user_message",
+                )
+            except Exception as pred_e:
+                print("[StrategyPredictor] 本地策略预测失败:", pred_e)
+                local_strategy_prediction = {
+                    "source": "error",
+                    "strategy": "本地策略预测失败；按当前输入克制回应。",
+                    "confidence": 0.0,
+                    "error": str(pred_e),
+                }
+            current_response_card_str = build_current_response_card(
+                self.user_text,
+                has_attachment=has_attachment,
+                local_prediction=local_strategy_prediction,
+            )
+            try:
+                recommendation_decision = recommendation_runtime.suggest(
+                    user_text=self.user_text,
+                    user_profile=user_profile_context_str,
+                    recent_context=recent_turns_for_learning,
+                    matched_memories=matched_memories,
+                    time_features=local_strategy_prediction.get("time_features"),
+                    trigger_type="user_message",
+                    top_k=3,
+                    strategy_prediction=local_strategy_prediction,
+                )
+            except Exception as rec_e:
+                print("[Recommender] 推荐器运行失败:", rec_e)
+                recommendation_decision = {
+                    "should_recommend": False,
+                    "reason": f"推荐器运行失败: {rec_e}",
+                    "candidates": [],
+                }
+            recommendation_context_str = format_recommendation_for_prompt(recommendation_decision)
+            try:
+                external_content_decision = rss_content_runtime.suggest(
+                    user_text=self.user_text,
+                    user_profile=user_profile_context_str,
+                    recent_context=recent_turns_for_learning,
+                    strategy_prediction=local_strategy_prediction,
+                    trigger_type="user_message",
+                    allow_refresh=True,
+                )
+            except Exception as rss_e:
+                print("[RSS] 外部内容推荐器运行失败:", rss_e)
+                external_content_decision = {
+                    "should_recommend": False,
+                    "reason": f"RSS recommender failed: {rss_e}",
+                    "item": None,
+                }
+            external_content_context_str = format_external_content_for_prompt(external_content_decision)
 
             system_prompt = f"""你是久远寺有珠（Kuonji Alice），型月世界观《魔法使之夜》中的魔女。
 【核心设定】：你性格孤高、冷淡、守旧、沉默寡言。你说话简短，通常带有距离感，但在熟悉之后会展露出一丝傲娇和隐晦的关心。你遵守魔女的传统，不苟言笑。隐藏于现代的魔女，最后的鸟。自小生活在魔术世界的少女。因某种原因离开故乡英国，并定居于日本的地方城市。
@@ -2684,13 +3787,17 @@ class LLMFetcherThread(QThread):
 
 【4. 现在面临什么问题，以及当前应对判断】
 {current_response_card_str}
+【本地推荐器】：它只负责判断本轮是否适合推荐具体行动，以及推荐什么；你仍然要按角色语气自然表达：
+{recommendation_context_str}
+銆愬閮ㄥ唴瀹规帹鑽愬櫒銆戯細瀹冨彧璐熻矗鎺ㄨ崘缃戦〉/瑙嗛/闊抽閾炬帴锛屼笉璐熻矗寤鸿鐢ㄦ埛鍘诲仛鐜板疄琛屽姩锛屼笉瑕佸拰銆愭湰鍦版帹鑽愬櫒銆戞贩涓€璧凤細
+{external_content_context_str}
 
 【5. 工具、记忆与知识】
 【用户画像】：以下是根据长期记忆聚合出的结构化用户画像，格式接近 JSON。长期记忆原文不会直接提供给你，请只依据画像理解用户；画像是稳定倾向，不是刚发生的事实：
 {user_profile_context_str}
 【本轮相关短期记忆】：以下是可衰减的工作记忆，只用于辅助当前回复：
 {memory_context_str}
-【外部知识库】：以下是你脑海中的扩展知识（如果有）：
+【外部知识库工具】：这是用户导入资料的检索工具；只有本轮明确调用时才会有资料，未调用时不要假装查过资料：
 {knowledge_context_str}
 【表情包触发机制】：以下是你可以使用的表情包情感分类和对应触发场景：
 {categories_str}
@@ -2712,6 +3819,8 @@ class LLMFetcherThread(QThread):
                 openai_api_base=base_url,
                 max_tokens=reply_max_tokens,
                 temperature=rag_params["temperature"],
+                timeout=45,
+                max_retries=0,
                 model_kwargs={
                     "extra_body": {"thinking": {"type": "disabled"}}
                 }
@@ -2783,6 +3892,49 @@ class LLMFetcherThread(QThread):
                     emotion = matched_str
                 reply_text = reply_text[:emotion_match.start()].strip()
 
+            try:
+                learning_event = build_interaction_event(
+                    user_text=self.user_text,
+                    assistant_text=reply_text,
+                    trigger_type="user_message",
+                    trigger_source="chat",
+                    recent_turns=recent_turns_for_learning,
+                    user_profile_snapshot=user_profile_context_str,
+                    system_state_snapshot=runtime_state_snapshot,
+                    retrieved_memories=matched_memories,
+                    knowledge_results=kb_results,
+                    knowledge_tool_info=kb_route,
+                    search_keywords=search_keywords,
+                    extracted_fact=new_fact,
+                    current_response_card=current_response_card_str,
+                    local_prediction=local_strategy_prediction,
+                    emotion_tag=emotion,
+                    has_attachment=has_attachment,
+                    attachment_name=self.image_path or "",
+                    models={
+                        "main": model_main,
+                        "extractor": model_extractor,
+                        "knowledge_router": "local_explicit_router",
+                    },
+                    rag_params=rag_params,
+                )
+                learning_event["strategy"]["recommendation_used"] = bool(
+                    recommendation_decision.get("should_recommend")
+                )
+                learning_event["strategy"]["recommended_action"] = (
+                    recommendation_decision.get("selected_action") or {}
+                )
+                learning_event["strategy"]["recommendation_candidates"] = (
+                    recommendation_decision.get("candidates") or []
+                )
+                learning_event["strategy"]["recommendation_decision"] = recommendation_decision
+                learning_event["external_content_recommendation"] = external_content_decision
+                log_interaction_event(learning_event, enqueue_label=True)
+                schedule_auto_label_batch(reason="assistant_reply")
+            except Exception as learn_e:
+                print(f"[LearningLog] 交互样本写入失败: {learn_e}")
+                learning_event = None
+
             # 关键：在追加 markdown 图片链接之前把"干净文本"写入对话历史，
             # 这样下次组 prompt 时不会把 ![xx](url) 这种东西塞回去。
             try:
@@ -2805,7 +3957,7 @@ class LLMFetcherThread(QThread):
                 lap("等记忆写入完成（与主回复并行）")
 
             # ===== 6. 把回复抛给 UI =====
-            self.finished_signal.emit(reply_text)
+            self.finished_signal.emit(reply_text, learning_event or {})
             lap("已 emit 回复")
             print(f"[Pet][耗时] === 总计 {time.perf_counter() - t0:.2f}s ===")
 
@@ -2839,6 +3991,20 @@ class ChatWindow(QWidget):
         self.pending_image_path = None
         self.last_user_message_for_feedback = ""
         self.feedback_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "feedback_data.jsonl")
+        self._dragging = False
+        self._drag_offset = None
+        self._resizing = False
+        self._resize_edges = set()
+        self._resize_start_pos = None
+        self._resize_start_geometry = None
+        self._resize_margin = 10
+        self._message_text_bubbles = []
+        self.maximize_btn = None
+        self._last_assistant_event_id = ""
+        self._last_assistant_reply_at = None
+        self._last_assistant_reply_text = ""
+        self.pending_intents = PendingIntentStore()
+        self._last_user_text_for_pending_skill = ""
         self.setAcceptDrops(True)
         self.init_ui()
 
@@ -2865,8 +4031,8 @@ class ChatWindow(QWidget):
             self.img_preview_label.clear()
             self.img_preview_label.setText("文件")
             self.img_preview_label.setStyleSheet(
-                "background-color: #07090D; border: 1px solid #46586B; "
-                "border-radius: 6px; font-size: 12px; color: #C6D4E2;"
+                "background-color: #231B32; border: 1px solid #3D2E55; "
+                "border-radius: 16px; font-size: 12px; color: #D1C8E1;"
             )
             
         self.img_preview_container.show()
@@ -2881,16 +4047,93 @@ class ChatWindow(QWidget):
         self.setWindowIcon(QIcon(transparent_pixmap))
         
         self.resize(400, 600)
-        self.setStyleSheet("background-color: #050607; color: #F1EBDD;")
+        self.setMinimumSize(360, 460)
+        self.setMouseTracking(True)
         
-        layout = QVBoxLayout(self)
+        # 为了让无边框+透明背景+阴影生效，包一层 container
+        self.container = QFrame(self)
+        self.container.setObjectName("MainContainer")
+        self.container.setStyleSheet("""
+            QFrame#MainContainer {
+                background-color: #1A1525;
+                border-radius: 20px;
+                border: 1px solid #3D2E55;
+            }
+            QFrame#ChatTitleBar {
+                background: transparent;
+                border: none;
+                border-bottom: 1px solid #2A203B;
+            }
+            QWidget { color: #EAE5F2; font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif; }
+        """)
+        
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(20, 20, 20, 20)
+        main_layout.addWidget(self.container)
+        
+        layout = QVBoxLayout(self.container)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
+
+        self.chat_header = QFrame(self.container)
+        self.chat_header.setObjectName("ChatTitleBar")
+        self.chat_header.setFixedHeight(38)
+        header_layout = QHBoxLayout(self.chat_header)
+        header_layout.setContentsMargins(14, 0, 10, 0)
+        header_layout.setSpacing(8)
+
+        title = QLabel("与有珠聊天")
+        title.setStyleSheet("color: #B886F8; font-size: 13px; font-weight: 500; background: transparent;")
+        header_layout.addWidget(title)
+        header_layout.addStretch()
+
+        title_btn_style = """
+            QPushButton {
+                background: transparent;
+                color: #B8ADC9;
+                border: none;
+                border-radius: 12px;
+                font-size: 14px;
+                font-weight: bold;
+            }
+            QPushButton:hover { background: #2A203B; color: #EAE5F2; }
+        """
+        minimize_btn = QPushButton("—")
+        minimize_btn.setFixedSize(26, 24)
+        minimize_btn.setToolTip("最小化")
+        minimize_btn.setStyleSheet(title_btn_style)
+        minimize_btn.clicked.connect(self.showMinimized)
+        header_layout.addWidget(minimize_btn)
+
+        self.maximize_btn = QPushButton("□")
+        self.maximize_btn.setFixedSize(26, 24)
+        self.maximize_btn.setToolTip("最大化")
+        self.maximize_btn.setStyleSheet(title_btn_style)
+        self.maximize_btn.clicked.connect(self.toggle_maximize_restore)
+        header_layout.addWidget(self.maximize_btn)
+
+        close_btn = QPushButton("✕")
+        close_btn.setFixedSize(26, 24)
+        close_btn.setToolTip("关闭")
+        close_btn.setStyleSheet("""
+            QPushButton {
+                background: transparent;
+                color: #B886F8;
+                border: none;
+                border-radius: 12px;
+                font-size: 13px;
+                font-weight: bold;
+            }
+            QPushButton:hover { background: #2A203B; color: #EAE5F2; }
+        """)
+        close_btn.clicked.connect(self.close)
+        header_layout.addWidget(close_btn)
+        layout.addWidget(self.chat_header)
         
         # 聊天记录区域
-        self.scroll_area = QScrollArea(self)
+        self.scroll_area = QScrollArea(self.container)
         self.scroll_area.setWidgetResizable(True)
-        self.scroll_area.setStyleSheet("border: none; background: #050607;")
+        self.scroll_area.setStyleSheet("border: none; background: transparent; border-top-left-radius: 20px; border-top-right-radius: 20px;")
         self.scroll_area.verticalScrollBar().setStyleSheet("""
             QScrollBar:vertical {
                 border: none;
@@ -2899,9 +4142,9 @@ class ChatWindow(QWidget):
                 margin: 0px 0px 0px 0px;
             }
             QScrollBar::handle:vertical {
-                background: #46586B;
+                background: #3D2E55;
                 min-height: 20px;
-                border-radius: 4px;
+                border-radius: 16px;
             }
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
                 border: none;
@@ -2920,8 +4163,8 @@ class ChatWindow(QWidget):
         layout.addWidget(self.scroll_area)
         
         # 底部输入区域
-        input_area = QWidget()
-        input_area.setStyleSheet("background-color: #050607; border-top: 1px solid #273546;")
+        input_area = QWidget(self.container)
+        input_area.setStyleSheet("background-color: transparent; border-top: 1px solid #3D2E55;")
         input_area_layout = QVBoxLayout(input_area)
         input_area_layout.setContentsMargins(15, 10, 15, 15)
         input_area_layout.setSpacing(5)
@@ -2935,8 +4178,8 @@ class ChatWindow(QWidget):
         self.img_preview_label = QLabel()
         self.img_preview_label.setFixedSize(60, 60)
         self.img_preview_label.setStyleSheet(
-            "background-color: #07090D; border: 1px solid #46586B; "
-            "border-radius: 6px; color: #C6D4E2;"
+            "background-color: #231B32; border: 1px solid #3D2E55; "
+            "border-radius: 16px; color: #D1C8E1;"
         )
         self.img_preview_label.setAlignment(Qt.AlignCenter)
         
@@ -2944,13 +4187,13 @@ class ChatWindow(QWidget):
         self.clear_img_btn.setFixedSize(20, 20)
         self.clear_img_btn.setStyleSheet("""
             QPushButton {
-                background-color: #20162E;
-                color: #F1EBDD;
-                border: 1px solid #775E90;
-                border-radius: 10px;
+                background-color: #3D2E55;
+                color: #EAE5F2;
+                border: 1px solid #B886F8;
+                border-radius: 16px;
                 font-weight: bold;
             }
-            QPushButton:hover { background-color: #34224A; }
+            QPushButton:hover { background-color: #4E3C6B; }
         """)
         self.clear_img_btn.clicked.connect(self.clear_pending_image)
         
@@ -2965,9 +4208,9 @@ class ChatWindow(QWidget):
         input_shell.setObjectName("chatInputShell")
         input_shell.setStyleSheet("""
             QWidget#chatInputShell {
-                background-color: #07090D;
-                border: 1px solid #46586B;
-                border-radius: 9px;
+                background-color: #231B32;
+                border: 1px solid #3D2E55;
+                border-radius: 16px;
             }
         """)
         input_shell.setMinimumHeight(54)
@@ -2984,9 +4227,9 @@ class ChatWindow(QWidget):
                 background-color: transparent;
                 border: none;
                 font-size: 20px;
-                color: #C6D4E2;
+                color: #D1C8E1;
             }
-            QPushButton:hover { background-color: #101724; border-radius: 6px; }
+            QPushButton:hover { background-color: #2A203B; border-radius: 16px; }
         """)
         self.sticker_btn.clicked.connect(self.choose_sticker)
         
@@ -2998,9 +4241,9 @@ class ChatWindow(QWidget):
                 background-color: transparent;
                 border: none;
                 font-size: 18px;
-                color: #C6D4E2;
+                color: #D1C8E1;
             }
-            QPushButton:hover { background-color: #101724; border-radius: 6px; }
+            QPushButton:hover { background-color: #2A203B; border-radius: 16px; }
         """)
         self.sync_btn.clicked.connect(self.sync_memes_to_cos)
         
@@ -3018,17 +4261,17 @@ class ChatWindow(QWidget):
                 border: none;
                 padding: 4px 6px;
                 font-size: 14px;
-                font-family: "Microsoft YaHei";
-                color: #F1EBDD;
-                selection-background-color: #34224A;
+                font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;
+                color: #EAE5F2;
+                selection-background-color: #4E3C6B;
             }
             QScrollBar:vertical {
                 width: 8px;
                 background: transparent;
             }
             QScrollBar::handle:vertical {
-                background: #46586B;
-                border-radius: 4px;
+                background: #3D2E55;
+                border-radius: 16px;
             }
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
                 height: 0px;
@@ -3039,16 +4282,16 @@ class ChatWindow(QWidget):
         self.send_btn.setFixedSize(58, 38)
         self.send_btn.setStyleSheet("""
             QPushButton {
-                background-color: #20162E;
-                color: #F1EBDD;
-                border: 1px solid #775E90;
-                border-radius: 6px;
+                background-color: #3D2E55;
+                color: #EAE5F2;
+                border: 1px solid #B886F8;
+                border-radius: 16px;
                 font-size: 14px;
                 font-weight: 500;
             }
             QPushButton:hover {
-                background-color: #34224A;
-                border-color: #B7A6D8;
+                background-color: #4E3C6B;
+                border-color: #A08CD2;
             }
             QPushButton:pressed {
                 background-color: #1B1328;
@@ -3070,7 +4313,186 @@ class ChatWindow(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
-        apply_dark_window_chrome(self)
+        self._sync_maximize_button()
+
+    def _sync_maximize_button(self):
+        btn = getattr(self, "maximize_btn", None)
+        if not btn:
+            return
+        if self.isMaximized():
+            btn.setText("❐")
+            btn.setToolTip("还原")
+        else:
+            btn.setText("□")
+            btn.setToolTip("最大化")
+
+    def toggle_maximize_restore(self):
+        if self.isMaximized():
+            self.showNormal()
+        else:
+            self.showMaximized()
+        self._sync_maximize_button()
+
+    def _resize_edges_at(self, pos):
+        if self.isMaximized():
+            return set()
+        margin = int(getattr(self, "_resize_margin", 8))
+        rect = self._resize_reference_rect()
+        edges = set()
+        if rect.left() - margin <= pos.x() <= rect.left() + margin:
+            edges.add("left")
+        elif rect.right() - margin <= pos.x() <= rect.right() + margin:
+            edges.add("right")
+        if rect.top() - margin <= pos.y() <= rect.top() + margin:
+            edges.add("top")
+        elif rect.bottom() - margin <= pos.y() <= rect.bottom() + margin:
+            edges.add("bottom")
+        return edges
+
+    def _resize_reference_rect(self):
+        container = getattr(self, "container", None)
+        if container is not None:
+            try:
+                return QRect(container.geometry())
+            except Exception:
+                pass
+        return self.rect()
+
+    @staticmethod
+    def _cursor_for_edges(edges):
+        if ("left" in edges and "top" in edges) or ("right" in edges and "bottom" in edges):
+            return Qt.SizeFDiagCursor
+        if ("right" in edges and "top" in edges) or ("left" in edges and "bottom" in edges):
+            return Qt.SizeBDiagCursor
+        if "left" in edges or "right" in edges:
+            return Qt.SizeHorCursor
+        if "top" in edges or "bottom" in edges:
+            return Qt.SizeVerCursor
+        return Qt.ArrowCursor
+
+    def _apply_resize(self, global_pos):
+        if not self._resize_start_geometry or not self._resize_start_pos:
+            return
+        delta = global_pos - self._resize_start_pos
+        geo = QRect(self._resize_start_geometry)
+        min_w = max(320, self.minimumWidth())
+        min_h = max(420, self.minimumHeight())
+        if "right" in self._resize_edges:
+            geo.setRight(max(geo.left() + min_w, geo.right() + delta.x()))
+        if "bottom" in self._resize_edges:
+            geo.setBottom(max(geo.top() + min_h, geo.bottom() + delta.y()))
+        if "left" in self._resize_edges:
+            geo.setLeft(min(geo.right() - min_w, geo.left() + delta.x()))
+        if "top" in self._resize_edges:
+            geo.setTop(min(geo.bottom() - min_h, geo.top() + delta.y()))
+        self.setGeometry(geo)
+
+    def nativeEvent(self, eventType, message):
+        if sys.platform.startswith("win"):
+            try:
+                is_windows_msg = (
+                    eventType == b"windows_generic_MSG"
+                    or str(eventType) == "windows_generic_MSG"
+                )
+                if is_windows_msg:
+                    msg = ctypes.wintypes.MSG.from_address(int(message))
+                    if msg.message == 0x0084:  # WM_NCHITTEST
+                        lparam = int(msg.lParam)
+                        x = ctypes.c_short(lparam & 0xFFFF).value
+                        y = ctypes.c_short((lparam >> 16) & 0xFFFF).value
+                        edges = self._resize_edges_at(self.mapFromGlobal(QPoint(x, y)))
+                        if edges:
+                            if "left" in edges and "top" in edges:
+                                return True, 13  # HTTOPLEFT
+                            if "right" in edges and "top" in edges:
+                                return True, 14  # HTTOPRIGHT
+                            if "left" in edges and "bottom" in edges:
+                                return True, 16  # HTBOTTOMLEFT
+                            if "right" in edges and "bottom" in edges:
+                                return True, 17  # HTBOTTOMRIGHT
+                            if "left" in edges:
+                                return True, 10  # HTLEFT
+                            if "right" in edges:
+                                return True, 11  # HTRIGHT
+                            if "top" in edges:
+                                return True, 12  # HTTOP
+                            if "bottom" in edges:
+                                return True, 15  # HTBOTTOM
+            except Exception:
+                pass
+        return super().nativeEvent(eventType, message)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            edges = self._resize_edges_at(event.pos())
+            if edges:
+                self._resizing = True
+                self._resize_edges = edges
+                self._resize_start_pos = event.globalPos()
+                self._resize_start_geometry = self.geometry()
+                self.setCursor(self._cursor_for_edges(edges))
+                event.accept()
+                return
+        if event.button() == Qt.LeftButton and hasattr(self, "chat_header") and not self.isMaximized():
+            header_pos = self.chat_header.mapTo(self, self.chat_header.rect().topLeft())
+            header_rect = self.chat_header.rect().translated(header_pos)
+            if header_rect.contains(event.pos()):
+                self._dragging = True
+                self._drag_offset = event.globalPos() - self.frameGeometry().topLeft()
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.LeftButton and hasattr(self, "chat_header"):
+            header_pos = self.chat_header.mapTo(self, self.chat_header.rect().topLeft())
+            header_rect = self.chat_header.rect().translated(header_pos)
+            if header_rect.contains(event.pos()) and not _is_interactive_widget(self.childAt(event.pos())):
+                self.toggle_maximize_restore()
+                event.accept()
+                return
+        super().mouseDoubleClickEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._resizing and event.buttons() == Qt.LeftButton:
+            self._apply_resize(event.globalPos())
+            event.accept()
+            return
+        if self._dragging and self._drag_offset is not None and event.buttons() == Qt.LeftButton:
+            self.move(event.globalPos() - self._drag_offset)
+            event.accept()
+            return
+        edges = self._resize_edges_at(event.pos())
+        self.setCursor(self._cursor_for_edges(edges))
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._dragging = False
+        self._drag_offset = None
+        self._resizing = False
+        self._resize_edges = set()
+        self._resize_start_pos = None
+        self._resize_start_geometry = None
+        self.setCursor(Qt.ArrowCursor)
+        super().mouseReleaseEvent(event)
+
+    def leaveEvent(self, event):
+        if not self._dragging and not self._resizing:
+            self.setCursor(Qt.ArrowCursor)
+        super().leaveEvent(event)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._sync_maximize_button()
+        max_width = max(180, int(self.width() * 0.65))
+        alive = []
+        for label in getattr(self, "_message_text_bubbles", []):
+            try:
+                label.setMaximumWidth(max_width)
+                alive.append(label)
+            except RuntimeError:
+                pass
+        self._message_text_bubbles = alive
 
     def clear_pending_image(self):
         self.pending_image_path = None
@@ -3089,7 +4511,7 @@ class ChatWindow(QWidget):
             else:
                 self.img_preview_label.clear()
                 self.img_preview_label.setText("📄")
-                self.img_preview_label.setStyleSheet("background-color: #E0E0E0; border-radius: 4px; font-size: 24px;")
+                self.img_preview_label.setStyleSheet("background-color: #E0E0E0; border-radius: 16px; font-size: 24px;")
             self.img_preview_container.show()
 
     def sync_memes_to_cos(self):
@@ -3110,6 +4532,161 @@ class ChatWindow(QWidget):
         else:
             self.add_message(f"❌ 同步失败: {msg}", is_user=False)
 
+    def _log_user_reply_followup(self, user_text):
+        event_id = str(self._last_assistant_event_id or "").strip()
+        if not event_id:
+            return
+        replied_after = None
+        if self._last_assistant_reply_at:
+            try:
+                replied_after = int((datetime.datetime.now() - self._last_assistant_reply_at).total_seconds())
+            except Exception:
+                replied_after = None
+        try:
+            log_feedback_event(
+                event_id=event_id,
+                feedback_value=0,
+                feedback_scope="user_replied_after_reply",
+                user_text=user_text,
+                assistant_text=self._last_assistant_reply_text,
+                extra={"user_replied_after_sec": replied_after},
+            )
+            schedule_auto_relabel_event(event_id, reason="user_replied_after_reply")
+        except Exception as e:
+            print(f"[LearningLog] user reply followup failed: {e}")
+        self._last_assistant_event_id = ""
+        self._last_assistant_reply_at = None
+        self._last_assistant_reply_text = ""
+
+    def _log_skill_execution(self, *, skill_name, arguments=None, user_text="", status="ok", source="chat", extra=None):
+        try:
+            payload = {
+                "skill_name": str(skill_name or ""),
+                "arguments": dict(arguments or {}),
+                "status": str(status or ""),
+                "source": str(source or ""),
+            }
+            payload.update(dict(extra or {}))
+            log_feedback_event(
+                event_id=payload.get("event_id", ""),
+                feedback_value=1 if status == "ok" else (-1 if status == "failed" else 0),
+                feedback_scope="skill_execution",
+                user_text=user_text,
+                assistant_text="",
+                extra=payload,
+            )
+        except Exception as e:
+            print(f"[Skill] execution log failed: {e}")
+
+    def _execute_pending_intent(self, intent, confirm_text):
+        if not intent:
+            return False
+        skill_name = str(intent.skill_name or "")
+        args = dict(intent.arguments or {})
+        if skill_name == "todo.add":
+            raw = {
+                "text": (args.get("text") or "").strip(),
+                "priority": args.get("priority") or "medium",
+                "category": args.get("category") or "other",
+                "endtime": args.get("due_date") or args.get("endtime") or "",
+                "tags": args.get("tags") if isinstance(args.get("tags"), list) else [],
+                "source": "pending_intent",
+            }
+            ok, item = todo_store().add(raw, dedup=True)
+            if ok and item:
+                self.add_message(f"已按刚才说的写入待办：{item.get('text')}", is_user=False)
+                if self.pet:
+                    self.pet.set_happy()
+                    self.pet.show_bubble("待办记下了。", duration=3000)
+                status = "ok"
+            elif item:
+                self.add_message(f"这条待办已经有相似项了：{item.get('text')}", is_user=False)
+                status = "deduped"
+            else:
+                status = "failed"
+            self._log_skill_execution(
+                skill_name=skill_name,
+                arguments=args,
+                user_text=confirm_text,
+                status=status,
+                source="pending_intent_confirmed",
+                extra={"intent": intent.to_dict()},
+            )
+            return True
+
+        if skill_name == "timer.start":
+            try:
+                seconds = int(args.get("seconds") or 0)
+            except Exception:
+                seconds = 0
+            if seconds > 0:
+                self.on_tool_timer_requested({
+                    "seconds": seconds,
+                    "label": (args.get("label") or "专注").strip()[:8] or "专注",
+                })
+                self._log_skill_execution(
+                    skill_name=skill_name,
+                    arguments=args,
+                    user_text=confirm_text,
+                    status="ok",
+                    source="pending_intent_confirmed",
+                    extra={"intent": intent.to_dict()},
+                )
+                return True
+            self._log_skill_execution(
+                skill_name=skill_name,
+                arguments=args,
+                user_text=confirm_text,
+                status="failed",
+                source="pending_intent_confirmed",
+                extra={"intent": intent.to_dict(), "reason": "invalid_seconds"},
+            )
+        return False
+
+    def _resolve_pending_intent_before_routing(self, text):
+        if not getattr(self, "pending_intents", None):
+            return False
+        state, intent = self.pending_intents.resolve_user_text(text)
+        if state == "confirmed" and intent:
+            return self._execute_pending_intent(intent, text)
+        if state == "rejected" and intent:
+            self.add_message("好，那刚才那个就不记。", is_user=False)
+            self._log_skill_execution(
+                skill_name=intent.skill_name,
+                arguments=intent.arguments,
+                user_text=text,
+                status="rejected",
+                source="pending_intent_rejected",
+                extra={"intent": intent.to_dict()},
+            )
+            return True
+        return False
+
+    def _capture_pending_intent_from_reply(self, reply_text, learning_event=None):
+        if not getattr(self, "pending_intents", None):
+            return
+        user_text = str(getattr(self, "_last_user_text_for_pending_skill", "") or "").strip()
+        if not user_text or has_explicit_todo_write_intent(user_text):
+            return
+        intent = build_pending_intent_from_reply(user_text, reply_text)
+        if not intent:
+            return
+        self.pending_intents.set(intent)
+        try:
+            event_id = learning_event.get("event_id", "") if isinstance(learning_event, dict) else ""
+            log_feedback_event(
+                event_id=event_id,
+                feedback_value=0,
+                feedback_scope="skill_pending_created",
+                user_text=user_text,
+                assistant_text=reply_text,
+                extra={"intent": intent.to_dict()},
+            )
+            if event_id:
+                schedule_auto_relabel_event(event_id, reason="skill_pending_created")
+        except Exception as e:
+            print(f"[Skill] pending intent log failed: {e}")
+
     def send_message(self):
         text = self.input_field.toPlainText().strip()
         img_path = self.pending_image_path
@@ -3118,6 +4695,8 @@ class ChatWindow(QWidget):
             return
 
         self.last_user_message_for_feedback = text or ("[用户发送了图片/文件]" if img_path else "")
+        self._last_user_text_for_pending_skill = text or ""
+        self._log_user_reply_followup(text or "[USER_ATTACHMENT_REPLY]")
              
         # 添加用户消息
         self.add_message(text, is_user=True, image_path=img_path)
@@ -3125,25 +4704,11 @@ class ChatWindow(QWidget):
         self.clear_pending_image()
         
         # 如果绑定了桌宠，让它做出回应
-        timer_request = None
         if self.pet:
             self.pet.set_happy()
             self.pet.observe_user_message(text)
-            if text:
-                timer_request = parse_focus_timer_intent(text)
-                if timer_request:
-                    self.pet.start_focus_timer(
-                        timer_request["seconds"],
-                        label=timer_request.get("label") or "专注",
-                    )
-                    self.add_message(
-                        f"⏱ 已启动{timer_request.get('label', '专注')}定时：{timer_request['duration_text']}",
-                        is_user=False,
-                    )
-                    self.send_btn.setEnabled(True)
-                    self.send_btn.setText("发送")
-                    return
-            
+        pending_skill_handled = self._resolve_pending_intent_before_routing(text) if text else False
+             
         # 禁用发送按钮，防止重复提交
         self.send_btn.setEnabled(False)
         self.send_btn.setText("思考中...")
@@ -3156,16 +4721,39 @@ class ChatWindow(QWidget):
 
         # 并行启动 MCP 风格的工具路由线程：让模型自己判断该不该把这句话写成待办。
         # 仅在有文字输入时跑（纯图片消息基本不会触发"加待办"意图）。
-        if text and not timer_request:
+        if text and not pending_skill_handled:
             self.tool_router_thread = TodoToolRouterThread(text, todo_store())
+            self.tool_router_thread.timer_signal.connect(self.on_tool_timer_requested)
             self.tool_router_thread.result_signal.connect(self.on_tool_router_done)
             self.tool_router_thread.error_signal.connect(self.on_tool_router_error)
             self.tool_router_thread.start()
 
-    def on_llm_reply(self, reply_text):
+    def _schedule_reply_state_observation(self, learning_event, reply_text):
+        event_id = ""
+        if isinstance(learning_event, dict):
+            event_id = learning_event.get("event_id", "")
+        if not (event_id and self.pet and hasattr(self.pet, "_schedule_learning_state_observation")):
+            return
+        self.pet._schedule_learning_state_observation(
+            event_id,
+            assistant_text=reply_text,
+            scope="reply_followup_state",
+            extra={
+                "chat_visible_at_reply": bool(self.isVisible()),
+                "has_pending_image_at_reply": bool(self.pending_image_path),
+            },
+        )
+
+    def on_llm_reply(self, reply_text, learning_event=None):
         self.send_btn.setEnabled(True)
         self.send_btn.setText("发送")
-        self.add_message(reply_text, is_user=False)
+        self.add_message(reply_text, is_user=False, learning_event=learning_event or {})
+        self._schedule_reply_state_observation(learning_event or {}, reply_text)
+        self._capture_pending_intent_from_reply(reply_text, learning_event or {})
+        if isinstance(learning_event, dict) and learning_event.get("event_id"):
+            self._last_assistant_event_id = learning_event.get("event_id", "")
+            self._last_assistant_reply_at = datetime.datetime.now()
+            self._last_assistant_reply_text = reply_text or ""
         
         if self.pet:
             self.pet.show_bubble("回复你了,记得看信息", duration=3000)
@@ -3174,6 +4762,29 @@ class ChatWindow(QWidget):
         self.send_btn.setEnabled(True)
         self.send_btn.setText("发送")
         self.add_message(f"⚠️ {error_msg}", is_user=False)
+
+    def on_tool_timer_requested(self, timer_request):
+        if not self.pet or not isinstance(timer_request, dict):
+            return
+        try:
+            seconds = int(timer_request.get("seconds") or 0)
+        except Exception:
+            seconds = 0
+        if seconds <= 0:
+            return
+        label = (timer_request.get("label") or "专注").strip()[:8] or "专注"
+        if self.pet.is_focus_timer_active():
+            remaining = self.pet.get_focus_timer_remaining_seconds()
+            self.add_message(
+                f"⏱ 专注定时已经在跑了：还剩 {format_focus_duration(remaining)}。",
+                is_user=False,
+            )
+            return
+        self.pet.start_focus_timer(seconds, label=label)
+        self.add_message(
+            f"⏱ 已启动{label}定时：{format_focus_duration(seconds)}",
+            is_user=False,
+        )
 
     def on_tool_router_done(self, added_items, skipped_items):
         """TodoToolRouterThread 完成回调。把"加了哪些待办"用一条系统消息回显到聊天，
@@ -3210,6 +4821,7 @@ class ChatWindow(QWidget):
             record = {
                 "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
                 "message_id": getattr(msg_widget, "msg_id", ""),
+                "learning_event_id": getattr(msg_widget, "learning_event_id", ""),
                 "feedback": int(value),
                 "user_text": getattr(msg_widget, "feedback_user_text", ""),
                 "assistant_text": getattr(msg_widget, "feedback_assistant_text", ""),
@@ -3217,6 +4829,20 @@ class ChatWindow(QWidget):
             }
             with open(self.feedback_file, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            learning_event_id = getattr(msg_widget, "learning_event_id", "")
+            log_feedback_event(
+                event_id=learning_event_id,
+                message_id=getattr(msg_widget, "msg_id", ""),
+                feedback_value=int(value),
+                feedback_scope="reply_strategy",
+                user_text=getattr(msg_widget, "feedback_user_text", ""),
+                assistant_text=getattr(msg_widget, "feedback_assistant_text", ""),
+                extra={
+                    "legacy_source": "chat_feedback",
+                    "has_learning_event": bool(getattr(msg_widget, "learning_event_id", "")),
+                },
+            )
+            schedule_auto_relabel_event(learning_event_id, reason="reply_strategy_feedback")
             up = getattr(msg_widget, "feedback_up_btn", None)
             down = getattr(msg_widget, "feedback_down_btn", None)
             if up:
@@ -3238,17 +4864,17 @@ class ChatWindow(QWidget):
             btn.setToolTip("记录这条回复是否合你心意，用于后续偏好学习")
             btn.setStyleSheet("""
                 QPushButton {
-                    background: #07090D;
-                    color: #C6D4E2;
-                    border: 1px solid #46586B;
-                    border-radius: 4px;
+                    background: #231B32;
+                    color: #D1C8E1;
+                    border: 1px solid #3D2E55;
+                    border-radius: 16px;
                     font-size: 12px;
                     padding: 1px;
                 }
                 QPushButton:hover {
-                    background: #101724;
-                    color: #F1EBDD;
-                    border-color: #9FB7CC;
+                    background: #2A203B;
+                    color: #EAE5F2;
+                    border-color: #B886F8;
                 }
             """)
         up_btn.clicked.connect(lambda: self._record_reply_feedback(msg_widget, 1))
@@ -3260,7 +4886,89 @@ class ChatWindow(QWidget):
         layout.addStretch()
         return box
 
-    def add_message(self, text, is_user=True, image_path=None):
+    def _external_content_decision_from_event(self, learning_event, explicit_decision=None):
+        if isinstance(explicit_decision, dict) and explicit_decision.get("item"):
+            return explicit_decision
+        if isinstance(learning_event, dict):
+            decision = learning_event.get("external_content_recommendation")
+            if isinstance(decision, dict) and decision.get("item"):
+                return decision
+        return {}
+
+    def _build_external_content_actions(self, msg_widget, decision):
+        item = (decision or {}).get("item") or {}
+        url = str(item.get("url") or "").strip()
+        if not url.startswith(("http://", "https://")):
+            return None
+        title = str(item.get("title") or "推荐内容").strip()
+        box = QWidget()
+        layout = QHBoxLayout(box)
+        layout.setContentsMargins(0, 4, 0, 0)
+        layout.setSpacing(6)
+
+        open_btn = QPushButton("打开链接")
+        open_btn.setCursor(Qt.PointingHandCursor)
+        open_btn.setToolTip("通过桌宠打开推荐链接，并记录一次推荐点击反馈")
+        open_btn.setStyleSheet("""
+            QPushButton {
+                background: #2A203B;
+                color: #EAE5F2;
+                border: 1px solid #B886F8;
+                border-radius: 14px;
+                font-size: 12px;
+                padding: 5px 12px;
+            }
+            QPushButton:hover {
+                background: #3D2E55;
+                border-color: #D8B4FE;
+            }
+        """)
+        open_btn.clicked.connect(lambda _=False, w=msg_widget, d=decision: self._open_external_content_link(w, d))
+        box.open_btn = open_btn
+        layout.addWidget(open_btn)
+
+        hint = QLabel("点开会作为推荐正反馈")
+        hint.setStyleSheet("color: #B8ADC9; border: none; background: transparent; font-size: 11px;")
+        hint.setToolTip(title)
+        layout.addWidget(hint)
+        layout.addStretch()
+        return box
+
+    def _open_external_content_link(self, msg_widget, decision):
+        item = (decision or {}).get("item") or {}
+        url = str(item.get("url") or "").strip()
+        if not url.startswith(("http://", "https://")):
+            return
+        opened = QDesktopServices.openUrl(QUrl(url))
+        try:
+            event_id = getattr(msg_widget, "learning_event_id", "") or ""
+            log_feedback_event(
+                event_id=event_id,
+                message_id=getattr(msg_widget, "msg_id", ""),
+                feedback_value=1,
+                feedback_scope="external_content_clicked",
+                user_text="[OPEN_EXTERNAL_CONTENT_LINK]",
+                assistant_text=getattr(msg_widget, "feedback_assistant_text", ""),
+                extra={
+                    "opened": bool(opened),
+                    "item_id": item.get("id", ""),
+                    "url": url,
+                    "title": item.get("title", ""),
+                    "source_name": item.get("source_name", ""),
+                    "platform": item.get("platform", ""),
+                    "source_type": item.get("source_type", ""),
+                },
+            )
+            if event_id:
+                schedule_auto_relabel_event(event_id, reason="external_content_clicked")
+        except Exception as e:
+            print(f"[RSSFeedback] 记录链接点击失败: {e}")
+        btn = getattr(msg_widget, "external_open_btn", None)
+        if btn:
+            btn.setText("已打开")
+            btn.setEnabled(False)
+
+    def add_message(self, text, is_user=True, image_path=None, learning_event=None, external_content_decision=None):
         msg_widget = QWidget()
         msg_widget.setStyleSheet("background: transparent;")
         msg_widget.msg_id = uuid.uuid4().hex[:12]
@@ -3268,6 +4976,12 @@ class ChatWindow(QWidget):
         msg_widget.tts_thread = None
         msg_widget.is_user = is_user
         msg_widget.feedback = 0
+        msg_widget.learning_event = learning_event or {}
+        msg_widget.learning_event_id = (learning_event or {}).get("event_id", "")
+        msg_widget.external_content_decision = self._external_content_decision_from_event(
+            learning_event or {},
+            external_content_decision or {},
+        )
         h_layout = QHBoxLayout(msg_widget)
         h_layout.setContentsMargins(0, 0, 0, 0)
         
@@ -3286,16 +5000,16 @@ class ChatWindow(QWidget):
             pixmap = pixmap.scaled(36, 36, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
             avatar.setPixmap(pixmap)
             avatar.setStyleSheet("""
-                border-radius: 6px;
+                border-radius: 16px;
             """)
         else:
             # 如果图片不存在，回退到文字/emoji 占位
             avatar.setText("我" if is_user else "有")
             avatar.setStyleSheet(f"""
-                background-color: {'#20162E' if is_user else '#07090D'};
-                color: #F1EBDD;
-                border: 1px solid #46586B;
-                border-radius: 6px;
+                background-color: {'#3D2E55' if is_user else '#231B32'};
+                color: #EAE5F2;
+                border: 1px solid #3D2E55;
+                border-radius: 16px;
                 font-size: 14px;
             """)
         
@@ -3340,7 +5054,7 @@ class ChatWindow(QWidget):
                 img_label.setMovie(movie)
                 movie.start()
                 img_label.movie_ref = movie  # 保持引用防止被垃圾回收
-                img_label.setStyleSheet("border-radius: 4px;")
+                img_label.setStyleSheet("border-radius: 16px;")
                 bubble_layout.addWidget(img_label)
             elif ext.endswith(('.png', '.jpg', '.jpeg', '.bmp', '.webp')):
                 img_label = QLabel()
@@ -3349,19 +5063,19 @@ class ChatWindow(QWidget):
                 if pixmap.width() > max_img_w:
                     pixmap = pixmap.scaledToWidth(max_img_w, Qt.SmoothTransformation)
                 img_label.setPixmap(pixmap)
-                img_label.setStyleSheet("border-radius: 4px;")
+                img_label.setStyleSheet("border-radius: 16px;")
                 bubble_layout.addWidget(img_label)
             else:
                 # 文档类型，显示文件卡片
                 file_name = os.path.basename(image_path)
                 file_label = QLabel(f"文件 {file_name}")
                 file_label.setStyleSheet("""
-                    background-color: #07090D;
-                    border: 1px solid #46586B;
-                    border-radius: 6px;
+                    background-color: #231B32;
+                    border: 1px solid #3D2E55;
+                    border-radius: 16px;
                     padding: 8px;
                     font-size: 14px;
-                    color: #F1EBDD;
+                    color: #EAE5F2;
                 """)
                 bubble_layout.addWidget(file_label)
             
@@ -3376,17 +5090,18 @@ class ChatWindow(QWidget):
             bubble.setMaximumWidth(max_width)
             bubble.setStyleSheet("""
                 font-size: 14px;
-                font-family: "Microsoft YaHei";
-                color: #F1EBDD;
+                font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;
+                color: #EAE5F2;
                 border: none;
                 background: transparent;
             """)
+            self._message_text_bubbles.append(bubble)
             bubble_layout.addWidget(bubble)
             
         # 异步加载远程图片
         for url in remote_image_urls:
             img_label = QLabel("加载图片中...")
-            img_label.setStyleSheet("color: #A8AEB8; font-style: italic; background: transparent; border: none;")
+            img_label.setStyleSheet("color: #B8ADC9; font-style: italic; background: transparent; border: none;")
             bubble_layout.addWidget(img_label)
             
             downloader = ImageDownloader(url, img_label)
@@ -3412,9 +5127,9 @@ class ChatWindow(QWidget):
             # 用户：靠右
             if text or (image_path and not image_path.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp'))):
                 bubble_container.setStyleSheet("""
-                    background-color: #20162E;
-                    border: 1px solid #775E90;
-                    border-radius: 8px;
+                    background-color: #3D2E55;
+                    border: 1px solid #B886F8;
+                    border-radius: 16px;
                 """)
             else:
                 bubble_container.setStyleSheet("background: transparent;")
@@ -3425,9 +5140,9 @@ class ChatWindow(QWidget):
             # 机器人：靠左
             if text:
                 bubble_container.setStyleSheet("""
-                    background-color: #07090D;
-                    border: 1px solid #46586B;
-                    border-radius: 8px;
+                    background-color: #231B32;
+                    border: 1px solid #3D2E55;
+                    border-radius: 16px;
                 """)
             else:
                 bubble_container.setStyleSheet("background: transparent;")
@@ -3440,6 +5155,13 @@ class ChatWindow(QWidget):
                 speaker_btn = self._build_speaker_button(msg_widget, text)
                 msg_widget.speaker_btn = speaker_btn
                 h_layout.addWidget(speaker_btn, 0, Qt.AlignTop)
+                external_actions = self._build_external_content_actions(
+                    msg_widget,
+                    getattr(msg_widget, "external_content_decision", {}) or {},
+                )
+                if external_actions is not None:
+                    msg_widget.external_open_btn = getattr(external_actions, "open_btn", None)
+                    bubble_layout.addWidget(external_actions)
                 bubble_layout.addWidget(self._build_feedback_buttons(msg_widget))
 
             h_layout.addStretch()
@@ -3472,16 +5194,16 @@ class ChatWindow(QWidget):
             QPushButton {
                 background-color: transparent;
                 border: 1px solid transparent;
-                border-radius: 13px;
+                border-radius: 16px;
                 font-size: 16px;
-                color: #9FB7CC;
+                color: #B886F8;
             }
             QPushButton:hover {
-                background-color: #101724;
-                border-color: #46586B;
+                background-color: #2A203B;
+                border-color: #3D2E55;
             }
             QPushButton:disabled {
-                color: #46586B;
+                color: #3D2E55;
             }
         """)
         btn.setEnabled(False)
@@ -3567,21 +5289,21 @@ class ChatWindow(QWidget):
         menu = QMenu(self)
         menu.setStyleSheet("""
             QMenu {
-                background-color: #050607;
-                color: #F1EBDD;
-                border: 1px solid #46586B;
-                border-radius: 8px;
+                background-color: #1A1525;
+                color: #EAE5F2;
+                border: 1px solid #3D2E55;
+                border-radius: 16px;
                 padding: 6px;
                 font-size: 13px;
             }
             QMenu::item {
                 padding: 8px 24px;
-                border-radius: 6px;
+                border-radius: 16px;
                 background: transparent;
             }
             QMenu::item:selected {
-                background-color: #20162E;
-                color: #F1EBDD;
+                background-color: #3D2E55;
+                color: #EAE5F2;
             }
         """)
         act_del = menu.addAction("删除这条消息")
@@ -3633,6 +5355,10 @@ class ChatWindow(QWidget):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
+    install_qt_message_filter()
+    single_instance_lock = acquire_single_instance_lock()
+    if single_instance_lock is None:
+        sys.exit(0)
 
     # 1) 先做必填项检查：MySQL 密码 / 火山方舟 API Key 缺一不可。
     #    用户没填的话弹设置窗口；用户取消也允许跳过（桌宠仍会启动，但相应功能不可用）。

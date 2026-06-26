@@ -933,6 +933,8 @@ def _call_profile_refiner_llm(evidence_text, category_hint, existing_claims):
             openai_api_base=base_url,
             max_tokens=700,
             temperature=0.1,
+            timeout=25,
+            max_retries=0,
         )
         raw = llm.invoke([HumanMessage(content=prompt)]).content.strip()
         return _extract_json_object(raw)
